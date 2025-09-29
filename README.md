@@ -19,7 +19,7 @@ El planificador genera una secuencia de puntos de paso que el sistema de control
 Este planificador está implementado en **Python 3.x** y requiere las siguientes dependencias:
 
 ```bash
-pip install numpy matplotlib networkx shapely
+pip install numpy matplotlib networkx shapely opencv-python
 ```
 Estas librerías se usan para:
 
@@ -30,6 +30,8 @@ Estas librerías se usan para:
 -networkx → Representación y manipulación de grafos.
 
 -shapely → Cálculos geométricos con polígonos, puntos y líneas.
+
+-OpenCV → Para cargar el mapa en escala de grises, procesar máscaras y dibujar en ventanas la evolución del árbol y la trayectoria.
 
  Ejecución
 Clona el repositorio:
