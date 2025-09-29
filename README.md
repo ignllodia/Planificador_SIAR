@@ -42,7 +42,6 @@ cd Planificador_SIAR
 ```
 Configura los parámetros del planificador editando los archivos en **`RRt_Conf/`**.
 
-Ejecuta el script principal del planificador (será el script con una versión, ejm: _v0)
 
 ```bash
 
