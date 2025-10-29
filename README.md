@@ -33,7 +33,7 @@ Estas librerías se usan para:
 
 -OpenCV → Para cargar el mapa en escala de grises, procesar máscaras y dibujar en ventanas la evolución del árbol y la trayectoria.
 
- Ejecución
+## Ejecución
 Clona el repositorio:
 
 ```bash
@@ -43,6 +43,3 @@ cd Planificador_SIAR
 Configura los parámetros del planificador editando los archivos en **`RRt_Conf/`**.
 
 
-```bash
-
-python3 planificador.py
