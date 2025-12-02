@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import random
 import math
+from pathlib import Path
 
 # ----------------------
 # ⚙ Parámetros principales
@@ -29,15 +30,18 @@ tabla_configuraciones = [
     (150,  0.51, -0.14),
 ]
 
-# Función corregida: longitud en función del ancho
+# Función corregida: longitud en función del ancho (en metros)
 def calcular_largo(ancho):
-    return -0.675 * ancho + 1.3175
+    # Relación lineal entre ancho (m) y largo (m)
+    return -1.1667 * ancho + 1.8267
+
 
 # Cargar imagen y preparar máscaras
-img_original = cv2.imread('Pb4.png')
+IMG_PATH = Path(__file__).parent / 'Pb4.png'
+img_original = cv2.imread(str(IMG_PATH))
 if img_original is None:
-    print("No se pudo cargar la imagen.")
-    exit()
+    print(f"No se pudo cargar la imagen en: {IMG_PATH}")
+    raise SystemExit(1)
 height, width, _ = img_original.shape
 gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
 mask_walls = cv2.inRange(gray, 90, 110)

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Planificador RRT kinodinámico para SIAR (modelo uniciclo + ajuste de ancho).
+Planificador BiRRT kinodinámico para SIAR (modelo uniciclo + ajuste de ancho).
 - Búsqueda nearest híbrida (subset + exacta periódica)
 - Validación por ROI del polígono del robot
 - Chequeo incremental en propagate
-- Visualización del árbol y estados intermedios
+- Visualización del árbol y estados intermedios (dos árboles)
 - Estabilidad con apoyos en ruedas y CoG dentro del hull
 - Cambio de conjunto de controles por "atasco" (histéresis y cooldown).
 """
@@ -46,8 +46,8 @@ def config_from_w(w): return min(TABLA_CONFIGURACIONES, key=lambda r: abs(r[1]-w
 # --------------------- Planificador ---------------------
 MAX_ITERS = 60000
 GOAL_SAMPLING_RATE = 0.10
-DT = 0.05     #0.09
-TPROP = 0.5 #0.5  #0.02
+DT = 0.05    #0.09
+TPROP = 0.5  #0.02
 CHECK_STEP = 3
 NEAR_GOAL_DIST = m2px(0.30)
 NEAR_GOAL_DTH  = math.radians(20.0)
@@ -61,11 +61,7 @@ RNG_SEED    = 12345
 
 # Dibujo
 DRAW_EVERY = 200
-N_FRAMES = 20
-
-#Debug
-DEBUG = True
-DEBUG_EVERY = 100   # imprime cada N iteraciones
+N_FRAMES = 10
 
 # Histéresis del cambio de modo (sin sensado geométrico)
 ENTER_TURN        = 20   # fallos seguidos para entrar en modo giros
@@ -75,9 +71,10 @@ MODE_FREEZE       = 1000  # enfriamiento: iter mínimas entre cambios
 # --------------------- Control sets ---------------------
 CONTROL_SET = [
     (0.25,  0.0,   0),   # recto
-    (0.25,  0.2,   0),   # suave izq
-    (0.25, -0.2,   0),   # suave dcha
+    (0.25,  0.1,   0),   # suave izq
+    (0.25, -0.1,   0),   # suave dcha
 ]
+CONTROL_SET_BACK = [(-v, w_z, step_ref) for (v, w_z, step_ref) in CONTROL_SET]
 CONTROL_SET_TURN = [
     (0.00,  0.0,  -1),   # estrechar parado
     (0.00,  0.0,  +1),   # ensanchar parado
@@ -86,6 +83,7 @@ CONTROL_SET_TURN = [
     (0.12,  0.3,   0),   # giro medio izq
     (0.12, -0.3,   0),   # giro medio dcha
 ]
+CONTROL_SET_TURN_BACK = [(-v, w_z, step_ref) for (v, w_z, step_ref) in CONTROL_SET_TURN]
 
 # --------------------- Utilidades ---------------------
 def wrap_angle(a):
@@ -316,127 +314,154 @@ def draw_instructions(img):
         y += 22
 
 # --------------------- RRT ---------------------
-def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
+def plan_birrt(smap: SewerMap, start: State, goal: State, vis_img):
     rng = random.Random(RNG_SEED)
-    nodes = [Node(start, parent=-1, path=[], traj_states=[])]
     base_img = vis_img.copy()
     goal_px  = (int(goal.x), int(goal.y))
 
-    segs = []
+    # dos árboles: 0 desde start, 1 desde goal
+    trees = [
+        {'nodes': [Node(start, parent=-1, path=[], traj_states=[])],
+         'mode_ctx': {'mode': 'NORMAL', 'streak_fail': 0, 'streak_ok': 0, 'cooldown': 0},
+         'color': (120, 180, 255)},
+        {'nodes': [Node(goal,  parent=-1, path=[], traj_states=[])],
+         'mode_ctx': {'mode': 'NORMAL', 'streak_fail': 0, 'streak_ok': 0, 'cooldown': 0},
+         'color': (255, 180, 120)},
+    ]
+    segs = [[], []]
 
-    # conmutación de conjuntos de control por rachas (sin sensores frontales/laterales)
-    mode = 'NORMAL'      # 'NORMAL' / 'TURN'
-    streak_fail = 0
-    streak_ok   = 0
-    cooldown    = 0
-    print(f"[SET] {mode} (inicio)")
+    def nearest_idx(nodes, target, use_exact):
+        if use_exact or len(nodes) <= K_SUBSET:
+            dists = [state_distance(n.state, target) for n in nodes]
+            return int(np.argmin(dists))
+        idxs = rng.sample(range(len(nodes)), k=min(K_SUBSET, len(nodes)))
+        best, bestd = None, 1e18
+        for idx in idxs:
+            d = state_distance(nodes[idx].state, target)
+            if d < bestd: bestd, best = d, idx
+        return best
+
+    def update_mode(ctx, success, cooldown_hit):
+        if success:
+            ctx['streak_ok'] += 1
+            ctx['streak_fail'] = max(0, ctx['streak_fail'] - 1)
+            if ctx['mode'] == 'TURN' and not cooldown_hit and ctx['streak_ok'] >= EXIT_STREAK:
+                ctx['mode'] = 'NORMAL'; ctx['cooldown'] = MODE_FREEZE
+                print(f"[SET] TURN   -> NORMAL (exitos={ctx['streak_ok']})")
+        else:
+            ctx['streak_fail'] += 1
+            ctx['streak_ok'] = 0
+            if ctx['mode'] == 'NORMAL' and not cooldown_hit and ctx['streak_fail'] >= ENTER_TURN:
+                ctx['mode'] = 'TURN'; ctx['cooldown'] = MODE_FREEZE
+                print(f"[SET] NORMAL -> TURN   (fallos={ctx['streak_fail']})")
+
+    def extend_tree(tree_idx, target, use_exact):
+        nodes = trees[tree_idx]['nodes']
+        ctx   = trees[tree_idx]['mode_ctx']
+        if ctx['cooldown'] > 0:
+            ctx['cooldown'] -= 1
+
+        idx_near = nearest_idx(nodes, target, use_exact)
+        near = nodes[idx_near].state
+        forward = (tree_idx == 0)
+        if ctx['mode'] == 'NORMAL':
+            controls = CONTROL_SET if forward else CONTROL_SET_BACK
+        else:
+            controls = CONTROL_SET_TURN if forward else CONTROL_SET_TURN_BACK
+
+        best_state = None; best_path = None; best_traj = None; best_score = float('inf')
+        for u in controls:
+            ns, path_pts, traj_states = propagate(near, u, smap)
+            if ns is None: 
+                continue
+            d = state_distance(ns, target)
+            if d < best_score:
+                best_score, best_state = d, ns
+                best_path, best_traj = path_pts, traj_states
+
+        if best_state is None:
+            update_mode(ctx, success=False, cooldown_hit=(ctx['cooldown']>0))
+            return None, None
+
+        nodes.append(Node(best_state, parent=idx_near, path=best_path, traj_states=best_traj))
+        update_mode(ctx, success=True, cooldown_hit=(ctx['cooldown']>0))
+
+        if best_path is not None and len(best_path) > 1:
+            for i in range(1, len(best_path)):
+                segs[tree_idx].append((best_path[i-1], best_path[i]))
+        return len(nodes)-1, best_path
+
+    def flush_segments():
+        if not segs[0] and not segs[1]:
+            return
+        for t in (0,1):
+            col = trees[t]['color']
+            for (a,b) in segs[t]:
+                cv2.line(base_img, a, b, col, 1)
+            segs[t].clear()
+        tmp = base_img.copy()
+        draw_state(tmp, start, (0,200,0), 2, smap)
+        draw_state(tmp, goal,  (255,0,0), 2, smap)
+        cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
+        cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
 
     for it in range(MAX_ITERS):
-        if cooldown > 0:
-            cooldown -= 1
-        valid_controls = 0
+        use_exact = (it % EXACT_EVERY) == 0
+        tree_idx  = it % 2
+        other_idx = 1 - tree_idx
 
-        # --- sampleo del objetivo
+        # sampleo con sesgo hacia el otro objetivo
         if rng.random() < GOAL_SAMPLING_RATE:
-            tx, ty, tth, tw = goal.x, goal.y, goal.th, goal.w
+            if tree_idx == 0:
+                tx, ty, tth, tw = goal.x, goal.y, goal.th, goal.w
+            else:
+                tx, ty, tth, tw = start.x, start.y, start.th, start.w
         else:
             tx, ty = smap.sample_free(rng)
             tth = rng.uniform(-math.pi, math.pi)
             tw  = rng.uniform(ROBOT_W_MIN, ROBOT_W_MAX)
         target = State(tx, ty, tth, tw)
 
-        # --- nearest (aprox/exacto periódico)
-        if (it % EXACT_EVERY) == 0 or len(nodes) <= K_SUBSET:
-            dists = [state_distance(n.state, target) for n in nodes]
-            idx_near = int(np.argmin(dists))
-        else:
-            idxs = rng.sample(range(len(nodes)), k=min(K_SUBSET, len(nodes)))
-            best, bestd = None, 1e18
-            for idx in idxs:
-                d = state_distance(nodes[idx].state, target)
-                if d < bestd: bestd, best = d, idx
-            idx_near = best
-
-        near = nodes[idx_near].state
-
-        # --- selección del conjunto de controles según modo actual
-        controls = CONTROL_SET if mode == 'NORMAL' else CONTROL_SET_TURN
-
-        # --- intentar propagar con los controles activos
-        best_state = None; best_path = None; best_traj = None; best_score = float('inf')
-        for u in controls:
-            ns, path_pts, traj_states = propagate(near, u, smap)
-            if ns is None: 
-                continue
-            valid_controls += 1
-            d = state_distance(ns, target)
-            if d < best_score:
-                best_score, best_state = d, ns
-                best_path, best_traj = path_pts, traj_states
-
-        if DEBUG and (it % DEBUG_EVERY) == 0:
-            if best_state is None:
-                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} fail_streak={streak_fail} cooldown={cooldown}")
-            else:
-                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} d_target={best_score:.1f} pos=({best_state.x:.1f},{best_state.y:.1f})")
-        # --- actualizar rachas y conmutación
-        if best_state is None:
-            # no se añadió nodo
-            streak_fail += 1
-            streak_ok = 0
-            if mode == 'NORMAL' and cooldown == 0 and streak_fail >= ENTER_TURN:
-                mode = 'TURN'; cooldown = MODE_FREEZE
-                print(f"[SET] NORMAL -> TURN   @ iter={it} (fallos={streak_fail})")
-            # pintar amortiguado
-            if (it+1) % DRAW_EVERY == 0 and segs:
-                for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 1)
-                segs.clear()
-                tmp = base_img.copy()
-                draw_state(tmp, start, (0,200,0), 2, smap)
-                draw_state(tmp, goal,  (255,0,0), 2, smap)
-                cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
-                cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
+        new_idx, _ = extend_tree(tree_idx, target, use_exact)
+        if new_idx is None:
+            if (it+1) % DRAW_EVERY == 0:
+                flush_segments()
             continue
-        else:
-            # se añadió nodo válido
-            nodes.append(Node(best_state, parent=idx_near, path=best_path, traj_states=best_traj))
-            streak_ok += 1
-            streak_fail = max(0, streak_fail - 1)
-            if mode == 'TURN' and cooldown == 0 and streak_ok >= EXIT_STREAK:
-                mode = 'NORMAL'; cooldown = MODE_FREEZE
-                print(f"[SET] TURN   -> NORMAL @ iter={it} (exitos={streak_ok})")
 
-        # dibujo amortiguado del árbol
-        if best_path is not None and len(best_path) > 1:
-            for i in range(1, len(best_path)):
-                segs.append((best_path[i-1], best_path[i]))
-        if (it+1) % DRAW_EVERY == 0 and segs:
-            for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 1)
-            segs.clear()
-            tmp = base_img.copy()
-            draw_state(tmp, start, (0,200,0), 2, smap)
-            draw_state(tmp, goal,  (255,0,0), 2, smap)
-            cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
-            cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
+        new_state = trees[tree_idx]['nodes'][new_idx].state
 
-        # ¿hemos llegado?
-        if (math.hypot(best_state.x - goal.x, best_state.y - goal.y) < NEAR_GOAL_DIST and
-            ang_dist(best_state.th, goal.th) < NEAR_GOAL_DTH and
-            abs(best_state.w - goal.w) < NEAR_GOAL_DW):
+        # intento de conexión directa desde el otro árbol
+        connect_idx, _ = extend_tree(other_idx, new_state, use_exact=True)
+        if connect_idx is None:
+            if (it+1) % DRAW_EVERY == 0:
+                flush_segments()
+            continue
 
-            # reconstrucción de trayectoria
-            idx = len(nodes) - 1
-            sol_points, sol_states = [], []
-            while idx != -1:
-                n = nodes[idx]
-                if n.path:        sol_points.extend(n.path[::-1])
-                if n.traj_states: sol_states.extend(n.traj_states[::-1])
-                sol_states.append(n.state)
-                idx = n.parent
-            sol_points = sol_points[::-1]
-            sol_states = sol_states[::-1]
+        meet_state = trees[other_idx]['nodes'][connect_idx].state
+        if (math.hypot(meet_state.x - new_state.x, meet_state.y - new_state.y) < NEAR_GOAL_DIST and
+            ang_dist(meet_state.th, new_state.th) < NEAR_GOAL_DTH and
+            abs(meet_state.w - new_state.w) < NEAR_GOAL_DW):
 
-            # dibujo final
+            def unravel(nodes, idx):
+                pts, states = [], []
+                while idx != -1:
+                    n = nodes[idx]
+                    if n.path:        pts.extend(n.path[::-1])
+                    if n.traj_states: states.extend(n.traj_states[::-1])
+                    states.append(n.state)
+                    idx = n.parent
+                return pts[::-1], states[::-1]
+
+            pts_a, states_a = unravel(trees[tree_idx]['nodes'], new_idx)
+            pts_b, states_b = unravel(trees[other_idx]['nodes'], connect_idx)
+            pts_b.reverse(); states_b.reverse()  # de encuentro -> goal
+
+            if pts_a and pts_b and pts_a[-1] == pts_b[0]: pts_b = pts_b[1:]
+            if states_a and states_b and states_a[-1] == states_b[0]: states_b = states_b[1:]
+
+            sol_points = pts_a + pts_b
+            sol_states = states_a + states_b
+
             out = base_img.copy()
             if sol_points and len(sol_points) > 1:
                 for i in range(1, len(sol_points)):
@@ -471,7 +496,11 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
                 cx, cy = cog_pixel_from_table(goal); inside = False
             cv2.circle(out, (cx,cy), 4, (0,255,0) if inside else (0,0,255), -1)
 
-            return out, sol_points, nodes, it+1
+            all_nodes = trees[0]['nodes'] + trees[1]['nodes']
+            return out, sol_points, all_nodes, it+1
+
+        if (it+1) % DRAW_EVERY == 0:
+            flush_segments()
 
     # sin plan
     out = base_img.copy()
@@ -479,7 +508,8 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
     draw_state(out, goal,  (0,0,255), 2, smap)
     cv2.putText(out, "No se encontro la trayectoria", (10, smap.h-20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-    return out, None, nodes, MAX_ITERS
+    all_nodes = trees[0]['nodes'] + trees[1]['nodes']
+    return out, None, all_nodes, MAX_ITERS
 
 # --------------------- main ---------------------
 def main():
@@ -552,7 +582,7 @@ def main():
                 cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(900)
                 continue
 
-            plan_img, sol_points, nodes, iters = plan_rrt(smap, start_state, goal_state, walls_rgb)
+            plan_img, sol_points, nodes, iters = plan_birrt(smap, start_state, goal_state, walls_rgb)
             solution_img = plan_img
 
             msg = f"Iteraciones: {iters}"

@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Planificador RRT kinodinámico para SIAR (modelo uniciclo + ajuste de ancho).
-- Búsqueda nearest híbrida (subset + exacta periódica)
-- Validación por ROI del polígono del robot
-- Chequeo incremental en propagate
-- Visualización del árbol y estados intermedios
-- Estabilidad con apoyos en ruedas y CoG dentro del hull
-- Cambio de conjunto de controles por "atasco" (histéresis y cooldown).
+RRT kinodinamico para SIAR con guía por A* en el gutter.
+- A* 2D en la máscara de gutter para obtener un pasillo libre
+- Waypoints intermedios (30) con orientación/anchura fija
+- RRT sesgado a los waypoints hasta el goal
 """
 
 import cv2
 import numpy as np
 import math
 import random
+import heapq
 from dataclasses import dataclass
 
 # --------------------- Mapa ---------------------
@@ -23,14 +21,14 @@ ROBOT_LEN   = 0.88
 ROBOT_W_MIN = 0.52
 ROBOT_W_MAX = 0.85
 ROBOT_W0    = 0.70
-W_DOT_MAX   = 0.20  # no se usa explícitamente aquí
+W_DOT_MAX   = 0.20  # no se usa explicitamente aqui
 
 # --------------------- Escala ---------------------
-PIXELS_PER_M = 65
+PIXELS_PER_M = 75
 def m2px(m): return int(round(m * PIXELS_PER_M))
 def px2m(px): return float(px) / PIXELS_PER_M
 
-# --------------------- Tabla configuración estable ---------------------
+# --------------------- Tabla configuracion estable ---------------------
 TABLA_CONFIGURACIONES = [
     (0,    0.51,  0.14),(10,   0.58,  0.12),(20,   0.64,  0.09),
     (30,   0.68,  0.06),(40,   0.70,  0.04),(50,   0.71,  0.02),
@@ -45,9 +43,9 @@ def config_from_w(w): return min(TABLA_CONFIGURACIONES, key=lambda r: abs(r[1]-w
 
 # --------------------- Planificador ---------------------
 MAX_ITERS = 60000
-GOAL_SAMPLING_RATE = 0.10
-DT = 0.05     #0.09
-TPROP = 0.5 #0.5  #0.02
+GOAL_SAMPLING_RATE = 0.20
+DT = 0.05
+TPROP = 0.5
 CHECK_STEP = 3
 NEAR_GOAL_DIST = m2px(0.30)
 NEAR_GOAL_DTH  = math.radians(20.0)
@@ -56,21 +54,29 @@ TAU_H = 0.6
 
 # Nearest
 K_SUBSET    = 64
-EXACT_EVERY = 40
+EXACT_EVERY = 20
 RNG_SEED    = 12345
 
 # Dibujo
-DRAW_EVERY = 200
+DRAW_EVERY = 100
 N_FRAMES = 20
+N_WAYPOINTS = 10
 
-#Debug
+# Sesgo a waypoints y corredor
+WAYPOINT_BIAS = 0.8          # probabilidad de muestrear el waypoint activo
+CORRIDOR_WIDTH_M = 0.6       # ancho de banda lateral para muestreo libre (m)
+STAGNATION_ITERS = 300       # iteraciones sin mejora de d_target antes de forzar modo TURN
+STAGNATION_DELTA = 1.0       # mejora minima de d_target para resetear estancamiento
+CENTER_BIAS_WEIGHT = 0.05    # peso para penalizar cercania a pared en A*
+
+# Debug
 DEBUG = True
-DEBUG_EVERY = 100   # imprime cada N iteraciones
+DEBUG_EVERY = 200
 
-# Histéresis del cambio de modo (sin sensado geométrico)
-ENTER_TURN        = 20   # fallos seguidos para entrar en modo giros
-EXIT_STREAK       = 300  # éxitos seguidos para volver a modo normal
-MODE_FREEZE       = 1000  # enfriamiento: iter mínimas entre cambios
+# Histeresis del cambio de modo
+ENTER_TURN        = 100
+EXIT_STREAK       = 800
+MODE_FREEZE       = 1000
 
 # --------------------- Control sets ---------------------
 CONTROL_SET = [
@@ -80,11 +86,13 @@ CONTROL_SET = [
 ]
 CONTROL_SET_TURN = [
     (0.00,  0.0,  -1),   # estrechar parado
-    (0.00,  0.0,  +1),   # ensanchar parado
+   (0.00,  0.0,  +1),   # ensanchar parado
     (0.10,  0.6,   0),   # giro fuerte izq lento
     (0.10, -0.6,   0),   # giro fuerte dcha lento
     (0.12,  0.3,   0),   # giro medio izq
     (0.12, -0.3,   0),   # giro medio dcha
+    (0.15,  0.8,   0),   # giro fuerte avanzando
+    (0.15, -0.8,   0),
 ]
 
 # --------------------- Utilidades ---------------------
@@ -132,7 +140,7 @@ class SewerMap:
 
     def sample_free(self, rng):
         if len(self.free_points) == 0:
-            raise RuntimeError("No hay píxeles libres en el mapa.")
+            raise RuntimeError("No hay pixeles libres en el mapa.")
         i = rng.randrange(0, len(self.free_points))
         x, y = self.free_points[i]
         return int(x), int(y)
@@ -144,7 +152,7 @@ class SewerMap:
         vis[self.gutter_mask > 0] = (0,0,255)
         return vis
 
-# --------------------- Geometría robot ---------------------
+# --------------------- Geometria robot ---------------------
 def robot_polygon(state: State):
     L = m2px(calcular_largo(state.w))
     W = m2px(state.w)
@@ -181,7 +189,7 @@ def cog_pixel_from_table(state: State):
     c, s = math.cos(state.th), math.sin(state.th)
     return int(round(state.x + off_px*c)), int(round(state.y + off_px*s))
 
-# --------------------- Validación ---------------------
+# --------------------- Validacion ---------------------
 def _polygon_area(contour_int32):
     c = contour_int32.reshape(-1,2).astype(np.float32)
     return abs(cv2.contourArea(c))
@@ -222,7 +230,7 @@ def valid_configuration(smap: "SewerMap", state: State):
     if cv2.pointPolygonTest(hull.astype(np.float32), (float(cx), float(cy)), False) < 0: return False
     return True
 
-# --------------------- Dinámica ---------------------
+# --------------------- Dinamica ---------------------
 def propagate(state: State, control, smap: SewerMap):
     v, w_z, step_ref = control
     steps = max(1, int(round(TPROP / DT)))
@@ -232,16 +240,19 @@ def propagate(state: State, control, smap: SewerMap):
 
     cos, sin, wrap = math.cos, math.sin, wrap_angle
     inside = smap.inside_bounds
+    px_step = v * DT * PIXELS_PER_M
+
+    # objetivo de ancho fijo para todo el horizonte
+    i0   = min(range(len(WS)), key=lambda i: abs(WS[i]-w))
+    iref = max(0, min(len(WS)-1, i0 + step_ref))
+    wref = WS[iref]
 
     for k in range(steps):
         c, s = cos(th), sin(th)
-        x  += m2px(v*c*DT)
-        y  += m2px(v*s*DT)
+        x  += px_step * c
+        y  += px_step * s
         th  = wrap(th + w_z*DT)
 
-        i0   = min(range(len(WS)), key=lambda i: abs(WS[i]-w))
-        iref = max(0, min(len(WS)-1, i0 + step_ref))
-        wref = WS[iref]
         w   += ((wref - w)/TAU_H) * DT
         w    = min(max(w, ROBOT_W_MIN), ROBOT_W_MAX)
 
@@ -257,13 +268,111 @@ def propagate(state: State, control, smap: SewerMap):
     if not valid_configuration(smap, new_state): return None, None, None
     return new_state, path_pts, traj_states
 
-# --------------------- Métrica de estado ---------------------
+# --------------------- Metrica de estado ---------------------
 def state_distance(a: State, b: State):
+    if a is None or b is None:
+        return float('inf')
     dx, dy = a.x - b.x, a.y - b.y
     dpos = math.hypot(dx, dy)
     dth  = ang_dist(a.th, b.th)
     dw   = abs(a.w - b.w)
     return dpos + m2px(0.5)*dth + m2px(0.2)*dw
+
+# --------------------- A* en el gutter ---------------------
+def astar_path_gutter(smap: "SewerMap", start_xy, goal_xy):
+    sx, sy = start_xy; gx, gy = goal_xy
+    h, w = smap.h, smap.w
+    gutter = smap.gutter_mask
+
+    # campo de distancia para penalizar acercarse a pared (favorece centro)
+    gutter_bin = (gutter > 0).astype(np.uint8)
+    dist_field = cv2.distanceTransform(gutter_bin, cv2.DIST_L2, 3)
+    maxd = dist_field.max() if dist_field.size > 0 else 0.0
+
+    def cell_cost(x, y):
+        if maxd <= 0: return 1.0
+        return 1.0 + CENTER_BIAS_WEIGHT * (maxd - dist_field[y, x])
+
+    def inside(x, y): return 0 <= x < w and 0 <= y < h
+    def neigh(x, y):
+        for dx, dy in ((1,0), (-1,0), (0,1), (0,-1)):
+            nx, ny = x+dx, y+dy
+            if inside(nx, ny) and gutter[ny, nx] != 0:
+                yield nx, ny
+
+    start = (int(sx), int(sy)); goal = (int(gx), int(gy))
+    if not inside(*start) or not inside(*goal): return None
+    if gutter[start[1], start[0]] == 0 or gutter[goal[1], goal[0]] == 0: return None
+
+    openh = []
+    heapq.heappush(openh, (abs(sx-gx)+abs(sy-gy), 0, start))
+    came = {start: None}
+    gscore = {start: 0}
+
+    while openh:
+        _, gc, cur = heapq.heappop(openh)
+        if cur == goal:
+            path = []
+            while cur is not None:
+                path.append(cur); cur = came[cur]
+            return path[::-1]
+        for n in neigh(*cur):
+            ng = gc + cell_cost(n[0], n[1])
+            if ng < gscore.get(n, 1e18):
+                gscore[n] = ng
+                came[n] = cur
+                f = ng + abs(n[0]-gx) + abs(n[1]-gy)
+                heapq.heappush(openh, (f, ng, n))
+    return None
+
+def resample_points(path_px, n_points=30):
+    if not path_px or len(path_px) < 2: return []
+    pts = np.array(path_px, dtype=np.float32)
+    segs = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+    dist = np.concatenate(([0.0], np.cumsum(segs)))
+    total = dist[-1]
+    if total < 1e-6: return [tuple(map(int, pts[0]))]*n_points
+    targets = np.linspace(0, total, n_points)
+    res = []
+    for t in targets:
+        i = np.searchsorted(dist, t) - 1
+        i = max(0, min(len(segs)-1, i))
+        alpha = (t - dist[i]) / max(segs[i], 1e-6)
+        p = pts[i] + alpha * (pts[i+1] - pts[i])
+        res.append((float(p[0]), float(p[1])))
+    return res
+
+def build_waypoint_states(smap: "SewerMap", path_px, w_default=ROBOT_W0):
+    waypoints = []
+    resampled = resample_points(path_px, n_points=N_WAYPOINTS)
+    for i, (x, y) in enumerate(resampled):
+        if i < len(resampled)-1:
+            dx = resampled[i+1][0] - x
+            dy = resampled[i+1][1] - y
+        else:
+            dx = resampled[i][0] - resampled[i-1][0]
+            dy = resampled[i][1] - resampled[i-1][1]
+        th = math.atan2(dy, dx + 1e-6)
+        st = State(x, y, th, w_default)
+        if valid_configuration(smap, st):
+            waypoints.append(st)
+    return waypoints
+
+def point_polyline_dist(pt, poly):
+    if poly is None or len(poly) < 2:
+        return 1e18
+    px, py = float(pt[0]), float(pt[1])
+    best = 1e18
+    for i in range(len(poly)-1):
+        ax, ay = poly[i]; bx, by = poly[i+1]
+        vx, vy = bx-ax, by-ay
+        wx, wy = px-ax, py-ay
+        denom = vx*vx + vy*vy
+        t = 0.0 if denom == 0 else max(0.0, min(1.0, (vx*wx + vy*wy)/denom))
+        projx = ax + t*vx; projy = ay + t*vy
+        d = math.hypot(px - projx, py - projy)
+        if d < best: best = d
+    return best
 
 # --------------------- UI ---------------------
 class Picker:
@@ -316,19 +425,23 @@ def draw_instructions(img):
         y += 22
 
 # --------------------- RRT ---------------------
-def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
+def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img, waypoints=None, corridor_poly=None):
     rng = random.Random(RNG_SEED)
     nodes = [Node(start, parent=-1, path=[], traj_states=[])]
     base_img = vis_img.copy()
     goal_px  = (int(goal.x), int(goal.y))
 
+    wp_idx = 0
+    wp_tolerance = NEAR_GOAL_DIST
+
     segs = []
 
-    # conmutación de conjuntos de control por rachas (sin sensores frontales/laterales)
-    mode = 'NORMAL'      # 'NORMAL' / 'TURN'
+    mode = 'NORMAL'
     streak_fail = 0
     streak_ok   = 0
     cooldown    = 0
+    stagnation  = 0
+    last_best   = None
     print(f"[SET] {mode} (inicio)")
 
     for it in range(MAX_ITERS):
@@ -336,37 +449,57 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
             cooldown -= 1
         valid_controls = 0
 
-        # --- sampleo del objetivo
-        if rng.random() < GOAL_SAMPLING_RATE:
+        # --- sampleo del objetivo (sesgo a waypoint)
+        use_wp = waypoints is not None and wp_idx < len(waypoints)
+        cur_wp = waypoints[wp_idx] if use_wp else None
+        if use_wp and rng.random() < WAYPOINT_BIAS:
+            tx, ty, tth, tw = cur_wp.x, cur_wp.y, cur_wp.th, cur_wp.w
+        elif rng.random() < GOAL_SAMPLING_RATE:
             tx, ty, tth, tw = goal.x, goal.y, goal.th, goal.w
         else:
-            tx, ty = smap.sample_free(rng)
+            corridor_px = m2px(CORRIDOR_WIDTH_M)
+            attempts = 0
+            while True:
+                tx, ty = smap.sample_free(rng)
+                if corridor_poly is None:
+                    break
+                if point_polyline_dist((tx, ty), corridor_poly) <= corridor_px:
+                    break
+                attempts += 1
+                if attempts >= 30:
+                    break
             tth = rng.uniform(-math.pi, math.pi)
             tw  = rng.uniform(ROBOT_W_MIN, ROBOT_W_MAX)
         target = State(tx, ty, tth, tw)
+        if target is None:
+            continue
 
-        # --- nearest (aprox/exacto periódico)
+        # --- nearest (aprox/exacto periodico)
         if (it % EXACT_EVERY) == 0 or len(nodes) <= K_SUBSET:
             dists = [state_distance(n.state, target) for n in nodes]
             idx_near = int(np.argmin(dists))
         else:
             idxs = rng.sample(range(len(nodes)), k=min(K_SUBSET, len(nodes)))
-            best, bestd = None, 1e18
+            best, bestd = None, float('inf')
             for idx in idxs:
                 d = state_distance(nodes[idx].state, target)
                 if d < bestd: bestd, best = d, idx
-            idx_near = best
+            idx_near = best if best is not None else idxs[0]
 
         near = nodes[idx_near].state
+        if near is None:
+            if DEBUG:
+                print(f"[DBG it={it}] nodo nearest sin estado idx={idx_near}, se salta iter")
+            continue
 
-        # --- selección del conjunto de controles según modo actual
+        # --- seleccion del conjunto de controles segun modo actual
         controls = CONTROL_SET if mode == 'NORMAL' else CONTROL_SET_TURN
 
         # --- intentar propagar con los controles activos
         best_state = None; best_path = None; best_traj = None; best_score = float('inf')
         for u in controls:
             ns, path_pts, traj_states = propagate(near, u, smap)
-            if ns is None: 
+            if ns is None:
                 continue
             valid_controls += 1
             d = state_distance(ns, target)
@@ -374,31 +507,43 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
                 best_score, best_state = d, ns
                 best_path, best_traj = path_pts, traj_states
 
-        if DEBUG and (it % DEBUG_EVERY) == 0:
-            if best_state is None:
-                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} fail_streak={streak_fail} cooldown={cooldown}")
+        if best_state is not None:
+            if last_best is None or (last_best - best_score) > STAGNATION_DELTA:
+                last_best = best_score
+                stagnation = 0
             else:
-                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} d_target={best_score:.1f} pos=({best_state.x:.1f},{best_state.y:.1f})")
-        # --- actualizar rachas y conmutación
+                stagnation += 1
+                if mode == 'NORMAL' and cooldown == 0 and stagnation >= STAGNATION_ITERS:
+                    mode = 'TURN'; cooldown = MODE_FREEZE
+                    stagnation = 0
+                    print(f"[SET] NORMAL -> TURN   @ iter={it} (estancamiento)")
+
+        if DEBUG and (it % DEBUG_EVERY) == 0:
+            wp_str = f"wp={wp_idx}/{len(waypoints)}" if cur_wp is not None else "wp=None"
+            if best_state is None:
+                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} {wp_str}")
+            else:
+                print(f"[DBG it={it}] mode={mode} nearest={idx_near} valids={valid_controls} d_target={best_score:.1f} pos=({best_state.x:.1f},{best_state.y:.1f}) {wp_str}")
+
+        # --- actualizar rachas y conmutacion
         if best_state is None:
-            # no se añadió nodo
             streak_fail += 1
             streak_ok = 0
             if mode == 'NORMAL' and cooldown == 0 and streak_fail >= ENTER_TURN:
                 mode = 'TURN'; cooldown = MODE_FREEZE
                 print(f"[SET] NORMAL -> TURN   @ iter={it} (fallos={streak_fail})")
-            # pintar amortiguado
-            if (it+1) % DRAW_EVERY == 0 and segs:
-                for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 1)
-                segs.clear()
-                tmp = base_img.copy()
-                draw_state(tmp, start, (0,200,0), 2, smap)
-                draw_state(tmp, goal,  (255,0,0), 2, smap)
-                cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
-                cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
+        if (it+1) % DRAW_EVERY == 0 and segs:
+            for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 2)
+            segs.clear()
+            tmp = base_img.copy()
+            draw_state(tmp, start, (0,200,0), 2, smap)
+            draw_state(tmp, goal,  (255,0,0), 2, smap)
+            cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
+            if cur_wp is not None:
+                cv2.circle(tmp, (int(cur_wp.x), int(cur_wp.y)), 5, (0,0,255), 2)
+            cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
             continue
         else:
-            # se añadió nodo válido
             nodes.append(Node(best_state, parent=idx_near, path=best_path, traj_states=best_traj))
             streak_ok += 1
             streak_fail = max(0, streak_fail - 1)
@@ -406,25 +551,32 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
                 mode = 'NORMAL'; cooldown = MODE_FREEZE
                 print(f"[SET] TURN   -> NORMAL @ iter={it} (exitos={streak_ok})")
 
-        # dibujo amortiguado del árbol
+            if use_wp and best_state is not None and wp_idx < len(waypoints):
+                if math.hypot(best_state.x - waypoints[wp_idx].x, best_state.y - waypoints[wp_idx].y) < wp_tolerance:
+                    wp_idx += 1
+
+        # dibujo amortiguado del arbol
         if best_path is not None and len(best_path) > 1:
             for i in range(1, len(best_path)):
                 segs.append((best_path[i-1], best_path[i]))
         if (it+1) % DRAW_EVERY == 0 and segs:
-            for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 1)
+            for (a,b) in segs: cv2.line(base_img, a, b, (120,180,255), 2)
             segs.clear()
             tmp = base_img.copy()
             draw_state(tmp, start, (0,200,0), 2, smap)
             draw_state(tmp, goal,  (255,0,0), 2, smap)
             cv2.circle(tmp, goal_px, 5, (255,0,0), -1)
+            if cur_wp is not None:
+                cv2.circle(tmp, (int(cur_wp.x), int(cur_wp.y)), 5, (0,0,255), 2)
             cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(1)
 
-        # ¿hemos llegado?
-        if (math.hypot(best_state.x - goal.x, best_state.y - goal.y) < NEAR_GOAL_DIST and
+        # llegamos al goal?
+        if best_state is not None and (
+            math.hypot(best_state.x - goal.x, best_state.y - goal.y) < NEAR_GOAL_DIST and
             ang_dist(best_state.th, goal.th) < NEAR_GOAL_DTH and
             abs(best_state.w - goal.w) < NEAR_GOAL_DW):
 
-            # reconstrucción de trayectoria
+            # reconstruccion de trayectoria
             idx = len(nodes) - 1
             sol_points, sol_states = [], []
             while idx != -1:
@@ -442,8 +594,8 @@ def plan_rrt(smap: SewerMap, start: State, goal: State, vis_img):
                 for i in range(1, len(sol_points)):
                     cv2.line(out, sol_points[i-1], sol_points[i], (0,255,0), 2)
 
-            if len(sol_states) >= 7:
-                idxs = np.linspace(1, len(sol_states)-2, N_FRAMES, dtype=int)
+            if sol_states and N_FRAMES > 0:
+                idxs = np.linspace(0, len(sol_states)-1, N_FRAMES, dtype=int)
                 for j in idxs:
                     st = sol_states[j]
                     draw_state(out, st, (180,90,10), 2, smap)
@@ -539,7 +691,7 @@ def main():
             if not valid_configuration(smap, start_state):
                 tmp = base.copy()
                 draw_state(tmp, start_state, (0,255,255), 2, smap)
-                cv2.putText(tmp, "Start no válido", (10, 50),
+                cv2.putText(tmp, "Start no valido", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2, cv2.LINE_AA)
                 cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(900)
                 continue
@@ -547,16 +699,44 @@ def main():
             if not valid_configuration(smap, goal_state):
                 tmp = base.copy()
                 draw_state(tmp, goal_state, (0,255,255), 2, smap)
-                cv2.putText(tmp, "Goal no válido", (10, 50),
+                cv2.putText(tmp, "Goal no valido", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2, cv2.LINE_AA)
                 cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(900)
                 continue
 
-            plan_img, sol_points, nodes, iters = plan_rrt(smap, start_state, goal_state, walls_rgb)
+            # A* en el gutter
+            astar_path = astar_path_gutter(smap, picker.start_pos, picker.goal_pos)
+            if astar_path is None or len(astar_path) < 2:
+                tmp = base.copy()
+                cv2.putText(tmp, "A* no encontro camino en gutter", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+                cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(900)
+                continue
+
+            waypoints = build_waypoint_states(smap, astar_path, w_default=ROBOT_W0)
+            if len(waypoints) < 2:
+                tmp = base.copy()
+                cv2.putText(tmp, "Waypoints insuficientes", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+                cv2.imshow("RRT kinodinamico", tmp); cv2.waitKey(900)
+                continue
+
+            base = walls_rgb.copy()
+            draw_instructions(base)
+            for i in range(1, len(astar_path)):
+                cv2.line(base, astar_path[i-1], astar_path[i], (0,120,255), 1)
+            for wp in waypoints:
+                cv2.circle(base, (int(wp.x), int(wp.y)), 2, (0,100,255), -1)
+
+            print(f"[A*] nodos camino: {len(astar_path)} | waypoints validos: {len(waypoints)}")
+
+            corridor_poly = [(wp.x, wp.y) for wp in waypoints]
+
+            plan_img, sol_points, nodes, iters = plan_rrt(smap, start_state, goal_state, base, waypoints=waypoints, corridor_poly=corridor_poly)
             solution_img = plan_img
 
             msg = f"Iteraciones: {iters}"
-            if sol_points is None: msg += " | sin solución"
+            if sol_points is None: msg += " | sin solucion"
             else: msg += f" | nodos: {len(nodes)}"
             out = plan_img.copy()
             cv2.putText(out, msg, (10, smap.h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)

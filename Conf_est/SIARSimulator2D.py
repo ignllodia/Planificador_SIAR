@@ -23,12 +23,12 @@ tabla_configuraciones = [
 
 def longitud_en_funcion_del_ancho(ancho):
     # Interpolación lineal inversa basada en:
-    # Ancho 0.52 m => Longitud 1.08 m
-    # Ancho 0.85 m => Longitud 0.88 m
-    ancho_min = 0.52
-    ancho_max = 0.85
-    largo_min = 0.88
-    largo_max = 1.08
+    # Ancho 0.51 m => Longitud 0.98 m
+    # Ancho 0.71 m => Longitud 0.84 m
+    ancho_min = 0.51
+    ancho_max = 0.71
+    largo_min = 0.84
+    largo_max = 0.98
 
     if ancho < ancho_min:
         return largo_max
