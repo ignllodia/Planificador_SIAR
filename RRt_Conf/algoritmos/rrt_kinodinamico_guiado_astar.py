@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 RRT kinodinamico para SIAR con guía por A* en el gutter.
-- A* 2D en la máscara de gutter para obtener un pasillo libre
-- Waypoints intermedios (30) con orientación/anchura fija
-- RRT sesgado a los waypoints hasta el goal
 """
 
 import cv2

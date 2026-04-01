@@ -54,7 +54,6 @@ ROBOT_LEN   = 0.88            # largo nominal (m)
 ROBOT_W_MIN = 0.52            # ancho minimo permitido (m)
 ROBOT_W_MAX = 0.85            # ancho maximo permitido (m)
 ROBOT_W0    = 0.70            # ancho inicial (m)
-W_DOT_MAX   = 0.20            # vel. cambio ancho (no usada explicitamente)
 
 # --------------------- Escala ---------------------
 PIXELS_PER_M = 75             # pixeles por metro
@@ -438,7 +437,7 @@ def reference_deviation_mean_m(path_pts, ref_poly):
         return None
     return px2m(sum(devs_px) / len(devs_px))
 
-def compute_run_metrics(smap: "SewerMap", goal: State, sol_points, sol_states, elapsed, iterations,
+def compute_run_metrics(sol_points, sol_states, elapsed, iterations,
                         n_propagations, n_invalid, node_count, ref_poly=None, seed=None, success=False,
                         timed_out=False, timeout_retries=0, attempts=1):
     fail_pct = 100.0 * (n_invalid / max(1, n_propagations))
@@ -704,7 +703,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         if (time.perf_counter() - t0) > TREE_TIMEOUT:
             elapsed = time.perf_counter() - t0
             metrics = compute_run_metrics(
-                smap, goal, None, None, elapsed, it, n_propagations, n_invalid, len(nodes),
+                None, None, elapsed, it, n_propagations, n_invalid, len(nodes),
                 ref_poly=ref_poly, seed=seed, success=False, timed_out=True
             )
             return base_img, None, nodes, it, len(nodes), True, metrics
@@ -933,7 +932,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
             elapsed = t1 - t0
 
             metrics = compute_run_metrics(
-                smap, goal, sol_points, sol_states, elapsed, it+1, n_propagations, n_invalid, len(nodes),
+                sol_points, sol_states, elapsed, it+1, n_propagations, n_invalid, len(nodes),
                 ref_poly=ref_poly, seed=seed, success=True, timed_out=False
             )
             return out, sol_points, nodes, it + 1, len(nodes), False, metrics
@@ -947,7 +946,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
     t1 = time.perf_counter()
     elapsed = t1 - t0
     metrics = compute_run_metrics(
-        smap, goal, None, None, elapsed, MAX_ITERS, n_propagations, n_invalid, len(nodes),
+        None, None, elapsed, MAX_ITERS, n_propagations, n_invalid, len(nodes),
         ref_poly=ref_poly, seed=seed, success=False, timed_out=False
     )
     return out, None, nodes, MAX_ITERS, len(nodes), False, metrics
@@ -989,21 +988,19 @@ def merge_successful_attempt_metrics(total_metrics, success_metrics):
     merged["timeout_retries"] = total_metrics["timeout_retries"]
     return merged
 
-def run_single_simulation_with_retries(smap: SewerMap, start: State, goal: State, walls_rgb, picker,
+def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
                                        start_state: State, goal_state: State, run_idx: int, total_runs: int):
     timeout_retries = 0
     attempt_idx = 0
     cumulative_metrics = None
     last_result = None
-    astar_mode = None
 
     while True:
-        astar_path, astar_mode = astar_path_guided(smap, picker.start_pos, picker.goal_pos)
+        astar_path, _ = astar_path_guided(smap, picker.start_pos, picker.goal_pos)
         if astar_path is None or len(astar_path) < 2:
             return None, None, None, None, None, {
                 "type": "astar_fail",
                 "message": "A* no encontro camino transitable",
-                "astar_mode": astar_mode,
             }
 
         waypoints = build_waypoint_states(smap, astar_path, w_default=ROBOT_W0)
@@ -1011,7 +1008,6 @@ def run_single_simulation_with_retries(smap: SewerMap, start: State, goal: State
             return None, None, None, None, None, {
                 "type": "waypoint_fail",
                 "message": "Waypoints insuficientes",
-                "astar_mode": astar_mode,
             }
 
         base = walls_rgb.copy()
@@ -1029,7 +1025,7 @@ def run_single_simulation_with_retries(smap: SewerMap, start: State, goal: State
             seed=seed
         )
         cumulative_metrics = accumulate_attempt_metrics(cumulative_metrics, attempt_metrics)
-        last_result = (plan_img, sol_points, nodes, iters, node_count, astar_mode)
+        last_result = (plan_img, sol_points, nodes, iters, node_count)
 
         if sol_points is not None:
             final_metrics = merge_successful_attempt_metrics(cumulative_metrics, attempt_metrics)
@@ -1037,7 +1033,6 @@ def run_single_simulation_with_retries(smap: SewerMap, start: State, goal: State
             return plan_img, sol_points, nodes, iters, node_count, {
                 "type": "success",
                 "metrics": final_metrics,
-                "astar_mode": astar_mode,
             }
 
         if timed_out:
@@ -1050,14 +1045,13 @@ def run_single_simulation_with_retries(smap: SewerMap, start: State, goal: State
         final_metrics = cumulative_metrics.copy()
         final_metrics["timeout_retries"] = timeout_retries
         print_run_metrics(final_metrics, run_idx=run_idx, total_runs=total_runs)
-        plan_img, sol_points, nodes, iters, node_count, astar_mode = last_result
+        plan_img, sol_points, nodes, iters, node_count = last_result
         return plan_img, sol_points, nodes, iters, node_count, {
             "type": "failure",
             "metrics": final_metrics,
-            "astar_mode": astar_mode,
         }
 
-def run_repeated_experiments(smap: SewerMap, start: State, goal: State, walls_rgb, picker,
+def run_repeated_experiments(smap: SewerMap, walls_rgb, picker,
                              start_state: State, goal_state: State, repetitions):
     all_metrics = []
     best_result = None
@@ -1066,7 +1060,7 @@ def run_repeated_experiments(smap: SewerMap, start: State, goal: State, walls_rg
 
     for run_idx in range(repetitions):
         plan_img, sol_points, nodes, iters, node_count, run_info = run_single_simulation_with_retries(
-            smap, start, goal, walls_rgb, picker, start_state, goal_state, run_idx, repetitions
+            smap, walls_rgb, picker, start_state, goal_state, run_idx, repetitions
         )
 
         if run_info["type"] in ("astar_fail", "waypoint_fail"):
@@ -1163,8 +1157,7 @@ def main():
             show_instructions = False
             base = walls_rgb.copy()
             best_result, all_metrics = run_repeated_experiments(
-                smap, start_state, goal_state, walls_rgb, picker,
-                start_state, goal_state, max(1, REP_SIM)
+                smap, walls_rgb, picker, start_state, goal_state, max(1, REP_SIM)
             )
 
             if best_result is None:

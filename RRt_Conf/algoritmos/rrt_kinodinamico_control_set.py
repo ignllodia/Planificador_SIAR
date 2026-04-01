@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Planificador RRT kinodinámico para SIAR (modelo uniciclo + ajuste de ancho).
-- Búsqueda nearest híbrida (subset + exacta periódica)
-- Validación por ROI del polígono del robot
-- Chequeo incremental en propagate
-- Visualización del árbol y estados intermedios
-- Estabilidad con apoyos en ruedas y CoG dentro del hull
-- Cambio de conjunto de controles por "atasco" (histéresis y cooldown).
 """
 
 import cv2
