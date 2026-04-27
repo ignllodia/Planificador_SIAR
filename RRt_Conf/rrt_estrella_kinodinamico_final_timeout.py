@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-RRT* kinodinÃ¡mico guiado por A* para SIAR.
+RRT* kinodinámico guiado por A* para SIAR.
 Basado en rrt_kinodinamico_guiado_astar.py pero con rewiring (RRT*):
 """
 
@@ -60,7 +60,7 @@ PIXELS_PER_M = 65           # pixeles por metro
 def m2px(m): return int(round(m * PIXELS_PER_M))
 def px2m(px): return float(px) / PIXELS_PER_M
 
-# --------------------- Tabla configuraciÃ³n estable ---------------------
+# --------------------- Tabla configuración estable ---------------------
 TABLA_CONFIGURACIONES = [
     (0,    0.51,  0.14),(10,   0.58,  0.12),(20,   0.64,  0.09),
     (30,   0.68,  0.06),(40,   0.70,  0.04),(50,   0.71,  0.02),
@@ -308,7 +308,7 @@ class Viewer:
         self.cy += dy_sign * vh * VIEW_PAN_FRAC
         self._clamp_center()
 
-# --------------------- GeometrÃ­a ---------------------
+# --------------------- Geometrí­a ---------------------
 def robot_polygon(state: State):
     L = m2px(calcular_largo(state.w))
     W = m2px(state.w)
