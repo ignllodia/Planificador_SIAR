@@ -56,7 +56,7 @@ ROBOT_W_MAX = 0.85            # ancho maximo permitido (m)
 ROBOT_W0    = 0.70            # ancho inicial (m)
 
 # --------------------- Escala ---------------------
-PIXELS_PER_M = 75             # pixeles por metro
+PIXELS_PER_M = 65           # pixeles por metro
 def m2px(m): return int(round(m * PIXELS_PER_M))
 def px2m(px): return float(px) / PIXELS_PER_M
 
@@ -75,7 +75,8 @@ def config_from_w(w): return min(TABLA_CONFIGURACIONES, key=lambda r: abs(r[1]-w
 
 # --------------------- Planificador ---------------------
 MAX_ITERS = 50000             # iteraciones maximas
-TREE_TIMEOUT = 10.0           # segundos antes de reiniciar el arbol si no hay solucion
+TREE_TIMEOUT = 60.0           # segundos antes de reiniciar el arbol si no hay solucion
+POST_SOLUTION_IMPROVEMENT_TIME = 20  # segundos extra de refinamiento tras la primera solucion
 GOAL_SAMPLING_RATE = 0.1     # prob. de muestrear el goal
 DT = 0.05                     # paso de integracion (s)
 TPROP = 0.5                   # horizonte de propagacion (s)
@@ -95,6 +96,14 @@ REP_SIM = 1               # numero de simulaciones validas a ejecutar
 DRAW_EVERY = 100             # refresco de dibujo del arbol
 N_FRAMES = 6                 # fotogramas de la solucion a dibujar
 N_WAYPOINTS = 10              # waypoints generados desde A*
+WINDOW_NAME = "RRT* kinodinamico"
+VIEW_MAX_W = 1600
+VIEW_MAX_H = 900
+VIEW_ZOOM_STEP = 1.25
+VIEW_MAX_ZOOM = 12.0
+VIEW_PAN_FRAC = 0.18
+VISUAL_REF_MAX_DIM = 1400
+SHOW_STATE_LABELS = True
 
 # Sesgo a waypoints y corredor
 WAYPOINT_BIAS = 0.5           # prob. de muestrear waypoint activo
@@ -120,6 +129,8 @@ CONTROL_SET_ALL = [
     (0.35,  0.0,   0),
     (0.00,  0.0,  -1),
     (0.00,  0.0,  +1),
+    (0.00,  0.2,   0),
+    (0.00, -0.2,   0),
     (0.10,  0.6,   0),
     (0.10, -0.6,   0),
     (0.10,  0.3,   0),
@@ -191,6 +202,112 @@ class SewerMap:
         vis[self.gutter_mask > 0] = (0,0,255)
         return vis
 
+def visual_scale(smap: "SewerMap"):
+    max_dim = max(1, smap.w, smap.h)
+    return min(1.0, VISUAL_REF_MAX_DIM / float(max_dim))
+
+def visual_thickness(smap: "SewerMap", base=2, min_px=1):
+    return max(min_px, int(round(base * visual_scale(smap))))
+
+def visual_radius(smap: "SewerMap", base=4, min_px=1):
+    return max(min_px, int(round(base * visual_scale(smap))))
+
+def visual_font_scale(smap: "SewerMap", base=0.6, min_scale=0.35):
+    return max(min_scale, base * max(0.65, visual_scale(smap)))
+
+def visual_marker_size(smap: "SewerMap", base=7, min_px=4):
+    return max(min_px, int(round(base * max(0.7, visual_scale(smap)))))
+
+def draw_marker(img, pt, color, smap: "SewerMap", base_size=7, base_thickness=1,
+                marker_type=cv2.MARKER_CROSS):
+    cv2.drawMarker(
+        img,
+        (int(pt[0]), int(pt[1])),
+        color,
+        markerType=marker_type,
+        markerSize=visual_marker_size(smap, base=base_size),
+        thickness=visual_thickness(smap, base_thickness),
+        line_type=cv2.LINE_AA,
+    )
+
+class Viewer:
+    def __init__(self, smap: "SewerMap"):
+        self.map_w = smap.w
+        self.map_h = smap.h
+        fit = min(VIEW_MAX_W / max(1, self.map_w), VIEW_MAX_H / max(1, self.map_h), 1.0)
+        self.display_w = max(320, int(round(self.map_w * fit)))
+        self.display_h = max(240, int(round(self.map_h * fit)))
+        self.zoom = 1.0
+        self.cx = self.map_w / 2.0
+        self.cy = self.map_h / 2.0
+        self._last_view = (0, 0, self.map_w, self.map_h)
+
+    def reset(self):
+        self.zoom = 1.0
+        self.cx = self.map_w / 2.0
+        self.cy = self.map_h / 2.0
+
+    def _view_size(self):
+        vw = max(40, min(self.map_w, int(round(self.map_w / self.zoom))))
+        vh = max(40, min(self.map_h, int(round(self.map_h / self.zoom))))
+        return vw, vh
+
+    def _clamp_center(self):
+        vw, vh = self._view_size()
+        half_w = vw / 2.0
+        half_h = vh / 2.0
+        self.cx = min(max(self.cx, half_w), self.map_w - half_w)
+        self.cy = min(max(self.cy, half_h), self.map_h - half_h)
+
+    def current_view(self):
+        self._clamp_center()
+        vw, vh = self._view_size()
+        x0 = int(round(self.cx - vw / 2.0))
+        y0 = int(round(self.cy - vh / 2.0))
+        x0 = min(max(0, x0), self.map_w - vw)
+        y0 = min(max(0, y0), self.map_h - vh)
+        self._last_view = (x0, y0, vw, vh)
+        return self._last_view
+
+    def render(self, img):
+        x0, y0, vw, vh = self.current_view()
+        crop = img[y0:y0 + vh, x0:x0 + vw]
+        interp = cv2.INTER_AREA if (vw > self.display_w or vh > self.display_h) else cv2.INTER_LINEAR
+        return cv2.resize(crop, (self.display_w, self.display_h), interpolation=interp)
+
+    def show(self, img, extra_lines=None):
+        disp = self.render(img)
+        hud = [f"zoom x{self.zoom:.2f} | +/- zoom | WASD mover | f reajustar"]
+        if extra_lines:
+            hud.extend(extra_lines)
+        y = 18
+        for line in hud:
+            cv2.putText(disp, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+            y += 16
+        cv2.imshow(WINDOW_NAME, disp)
+
+    def display_to_map(self, x, y):
+        x0, y0, vw, vh = self.current_view()
+        if not (0 <= x < self.display_w and 0 <= y < self.display_h):
+            return None
+        mx = x0 + (x / max(1, self.display_w)) * vw
+        my = y0 + (y / max(1, self.display_h)) * vh
+        mx = min(max(0, int(round(mx))), self.map_w - 1)
+        my = min(max(0, int(round(my))), self.map_h - 1)
+        return mx, my
+
+    def zoom_in(self):
+        self.zoom = min(VIEW_MAX_ZOOM, self.zoom * VIEW_ZOOM_STEP)
+
+    def zoom_out(self):
+        self.zoom = max(1.0, self.zoom / VIEW_ZOOM_STEP)
+
+    def pan(self, dx_sign, dy_sign):
+        vw, vh = self._view_size()
+        self.cx += dx_sign * vw * VIEW_PAN_FRAC
+        self.cy += dy_sign * vh * VIEW_PAN_FRAC
+        self._clamp_center()
+
 # --------------------- GeometrÃ­a ---------------------
 def robot_polygon(state: State):
     L = m2px(calcular_largo(state.w))
@@ -228,7 +345,7 @@ def cog_pixel_from_table(state: State):
     c, s = math.cos(state.th), math.sin(state.th)
     return int(round(state.x + off_px*c)), int(round(state.y + off_px*s))
 
-# --------------------- ValidaciÃ³n ---------------------
+# --------------------- Validacion ---------------------
 def _polygon_area(contour_int32):
     c = contour_int32.reshape(-1,2).astype(np.float32)
     return abs(cv2.contourArea(c))
@@ -269,7 +386,7 @@ def valid_configuration(smap: "SewerMap", state: State):
     if cv2.pointPolygonTest(hull.astype(np.float32), (float(cx), float(cy)), False) < 0: return False
     return True
 
-# --------------------- DinÃ¡mica ---------------------
+# --------------------- Dinámica ---------------------
 def propagate(state: State, control, smap: SewerMap):
     v, w_z, step_ref = control
     steps = max(1, int(round(TPROP / DT)))
@@ -306,7 +423,7 @@ def propagate(state: State, control, smap: SewerMap):
     if not valid_configuration(smap, new_state): return None, None, None
     return new_state, path_pts, traj_states
 
-# --------------------- MÃ©trica ---------------------
+# --------------------- Métrica ---------------------
 def state_distance(a: State, b: State):
     dx, dy = a.x - b.x, a.y - b.y
     dpos = math.hypot(dx, dy)
@@ -560,13 +677,20 @@ def minimize_width_changes(sol_states, smap: "SewerMap"):
 
 # --------------------- Picker/UI ---------------------
 class Picker:
-    def __init__(self, smap: SewerMap):
-        self.smap = smap; self.reset()
+    def __init__(self, smap: SewerMap, viewer: Viewer = None):
+        self.smap = smap
+        self.viewer = viewer
+        self.reset()
     def reset(self):
         self.start_pos = None; self.start_th = None
         self.goal_pos  = None; self.goal_th  = None
         self.tmp_mode  = None
     def mouse(self, event, x, y, flags, param):
+        if self.viewer is not None:
+            mapped = self.viewer.display_to_map(x, y)
+            if mapped is None:
+                return
+            x, y = mapped
         if event == cv2.EVENT_LBUTTONDOWN:
             if self.start_pos is None:
                 self.start_pos = (x, y); self.tmp_mode = 'start'
@@ -582,14 +706,22 @@ class Picker:
     def have_start(self): return self.start_pos is not None and self.start_th is not None
     def have_goal(self):  return self.goal_pos  is not None and self.goal_th  is not None
 
-def draw_state(img, state: State, color, thickness=2, smap: "SewerMap" = None, show_details=True):
-    """Dibuja el polÃ­gono del robot y su orientaciÃ³n."""
+def draw_state(img, state: State, color, thickness=2, smap: "SewerMap" = None,
+               show_details=True, show_label=SHOW_STATE_LABELS):
+    """Dibuja el polí­gono del robot y su orientación."""
+    if smap is not None:
+        thickness = visual_thickness(smap, thickness)
+        arrow_thickness = visual_thickness(smap, 2)
+        font_scale = visual_font_scale(smap, 0.5, min_scale=0.30)
+    else:
+        arrow_thickness = 2
+        font_scale = 0.5
     poly = robot_polygon(state).reshape((-1,1,2))
     cv2.polylines(img, [poly], True, color, thickness)
     p0 = (int(state.x), int(state.y))
     p1 = (int(state.x + 0.35*math.cos(state.th)*m2px(1.0)),
           int(state.y + 0.35*math.sin(state.th)*m2px(1.0)))
-    cv2.arrowedLine(img, p0, p1, color, 2, tipLength=0.25)
+    cv2.arrowedLine(img, p0, p1, color, arrow_thickness, tipLength=0.25)
 
     if not show_details:
         return
@@ -604,21 +736,19 @@ def draw_state(img, state: State, color, thickness=2, smap: "SewerMap" = None, s
                 col = (0,0,0)
             else:
                 col = (0,255,0)
-            cv2.circle(img, (cx, cy), 3, col, -1)
+            draw_marker(img, (cx, cy), col, smap, base_size=6, base_thickness=1, marker_type=cv2.MARKER_CROSS)
 
-    cv2.putText(img, f"w={state.w:.3f} m", (int(state.x)+10, int(state.y)-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    if show_label:
+        cv2.putText(img, f"w={state.w:.3f} m", (int(state.x)+10, int(state.y)-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, max(1, thickness - 1), cv2.LINE_AA)
 
-def draw_instructions(img):
-    texts = [
+def instruction_lines():
+    return [
         "Clic izq: start (pos+orient)",
         "Clic der: goal  (pos+orient)",
         "ESPACIO: planificar | r: reset | q: salir",
+        "+/-: zoom | WASD: mover vista | f: reajustar",
     ]
-    y = 22
-    for t in texts:
-        cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-        y += 22
 
 # --------------------- RRT* ---------------------
 def path_cost(path_pts):
@@ -648,6 +778,40 @@ def can_connect_states(a: State, b: State):
         abs(a.w - b.w) <= REWIRE_W_TOL
     )
 
+def goal_reached(state: State, goal: State):
+    return (
+        math.hypot(state.x - goal.x, state.y - goal.y) < NEAR_GOAL_DIST and
+        ang_dist(state.th, goal.th) < NEAR_GOAL_DTH and
+        abs(state.w - goal.w) < NEAR_GOAL_DW
+    )
+
+def extract_solution(nodes, goal_idx, smap: "SewerMap"):
+    sol_points, sol_states = [], []
+    idx = goal_idx
+    while idx != -1:
+        n = nodes[idx]
+        if n.path:
+            sol_points.extend(n.path[::-1])
+        if n.traj_states:
+            sol_states.extend(n.traj_states[::-1])
+        sol_states.append(n.state)
+        idx = n.parent
+    sol_points = sol_points[::-1]
+    sol_states = sol_states[::-1]
+    sol_states = minimize_width_changes(sol_states, smap)
+    return sol_points, sol_states
+
+def best_goal_node_index(nodes, goal: State):
+    best_idx = None
+    best_cost = float('inf')
+    for idx, node in enumerate(nodes):
+        if not goal_reached(node.state, goal):
+            continue
+        if node.cost < best_cost:
+            best_cost = node.cost
+            best_idx = idx
+    return best_idx
+
 def propagate_subtree_cost_delta(nodes, children, root_idx, delta):
     if abs(delta) <= 1e-9:
         return
@@ -658,7 +822,7 @@ def propagate_subtree_cost_delta(nodes, children, root_idx, delta):
         stack.extend(children[idx])
 
 def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=None, corridor_poly=None,
-                  ref_poly=None, seed=None):
+                  ref_poly=None, seed=None, viewer: Viewer = None):
     rng = random.Random(RNG_SEED_BASE if seed is None else seed)
     nodes = [Node(start, parent=-1, path=[], traj_states=[], cost=0.0)]
     children = [[]]
@@ -671,6 +835,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
 
     neighbor_radius_px = m2px(NEIGHBOR_RADIUS_M)
     t0 = time.perf_counter()
+    first_solution_t = None
     n_propagations = 0
     n_invalid = 0
     controls = CONTROL_SET_ALL
@@ -698,15 +863,26 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
                 best_traj = traj_states
         return best_state, best_path, best_traj, best_score, valid_count
 
-    for it in range(MAX_ITERS):
-        # timeout para reiniciar si se estanca
-        if (time.perf_counter() - t0) > TREE_TIMEOUT:
-            elapsed = time.perf_counter() - t0
-            metrics = compute_run_metrics(
-                None, None, elapsed, it, n_propagations, n_invalid, len(nodes),
-                ref_poly=ref_poly, seed=seed, success=False, timed_out=True
-            )
-            return base_img, None, nodes, it, len(nodes), True, metrics
+    iters = 0
+    while True:
+        now = time.perf_counter()
+        # timeout y max iters solo aplican antes de la primera solucion
+        if first_solution_t is None:
+            if (now - t0) > TREE_TIMEOUT:
+                elapsed = now - t0
+                metrics = compute_run_metrics(
+                    None, None, elapsed, iters, n_propagations, n_invalid, len(nodes),
+                    ref_poly=ref_poly, seed=seed, success=False, timed_out=True
+                )
+                return base_img, None, nodes, iters, len(nodes), True, metrics
+            if iters >= MAX_ITERS:
+                break
+        else:
+            if (now - first_solution_t) > POST_SOLUTION_IMPROVEMENT_TIME:
+                break
+
+        it = iters
+        iters += 1
 
         valid_controls = 0
 
@@ -866,37 +1042,29 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         # refresco de dibujo
         if (it + 1) % DRAW_EVERY == 0 and segs:
             for (a, b) in segs:
-                cv2.line(base_img, a, b, (120, 180, 255), 2)
+                cv2.line(base_img, a, b, (120, 180, 255), visual_thickness(smap, 2))
             segs.clear()
 
             tmp = base_img.copy()
             draw_state(tmp, start, (0, 200, 0), 2, smap, show_details=False)
             draw_state(tmp, goal, (255, 0, 0), 2, smap, show_details=False)
-            cv2.circle(tmp, goal_px, 5, (255, 0, 0), -1)
+            draw_marker(tmp, goal_px, (255, 0, 0), smap, base_size=8, base_thickness=2, marker_type=cv2.MARKER_TILTED_CROSS)
             if cur_wp is not None:
-                cv2.circle(tmp, (int(cur_wp.x), int(cur_wp.y)), 5, (0, 255, 0), 2)
-            cv2.imshow("RRT* kinodinamico", tmp)
+                draw_marker(tmp, (int(cur_wp.x), int(cur_wp.y)), (0, 255, 0), smap, base_size=8, base_thickness=2, marker_type=cv2.MARKER_DIAMOND)
+            if viewer is not None:
+                viewer.show(tmp)
+            else:
+                cv2.imshow(WINDOW_NAME, tmp)
             cv2.waitKey(1)
 
         # condicion de llegada
-        if (
-            math.hypot(best_state.x - goal.x, best_state.y - goal.y) < NEAR_GOAL_DIST and
-            ang_dist(best_state.th, goal.th) < NEAR_GOAL_DTH and
-            abs(best_state.w - goal.w) < NEAR_GOAL_DW
-        ):
-            idx = len(nodes) - 1
-            sol_points, sol_states = [], []
-            while idx != -1:
-                n = nodes[idx]
-                if n.path:
-                    sol_points.extend(n.path[::-1])
-                if n.traj_states:
-                    sol_states.extend(n.traj_states[::-1])
-                sol_states.append(n.state)
-                idx = n.parent
-            sol_points = sol_points[::-1]
-            sol_states = sol_states[::-1]
-            sol_states = minimize_width_changes(sol_states, smap)
+        if goal_reached(best_state, goal) and first_solution_t is None:
+            first_solution_t = time.perf_counter()
+
+    if first_solution_t is not None:
+        best_idx = best_goal_node_index(nodes, goal)
+        if best_idx is not None:
+            sol_points, sol_states = extract_solution(nodes, best_idx, smap)
             for i in range(1, len(sol_states)):
                 if abs(sol_states[i].w - sol_states[i - 1].w) > 1e-6:
                     print(f"[MIN_WIDTH] cambio w en idx {i}: {sol_states[i-1].w:.3f} -> {sol_states[i].w:.3f}")
@@ -905,7 +1073,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
             # camino final
             if sol_points and len(sol_points) > 1:
                 for i in range(1, len(sol_points)):
-                    cv2.line(out, sol_points[i - 1], sol_points[i], (0, 255, 0), 2)
+                    cv2.line(out, sol_points[i - 1], sol_points[i], (0, 255, 0), visual_thickness(smap, 2))
 
             # configuraciones
             if sol_states and N_FRAMES > 0:
@@ -916,40 +1084,41 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
                     supports = support_points_pixels(smap, st)
                     if len(supports) >= 3:
                         hull = cv2.convexHull(np.array(supports, dtype=np.int32))
-                        cv2.polylines(out, [hull], True, (0, 255, 0), 1)
+                        cv2.polylines(out, [hull], True, (0, 255, 0), visual_thickness(smap, 1))
                         cx, cy = cog_pixel_from_table(st)
                         inside = cv2.pointPolygonTest(hull.astype(np.float32), (float(cx), float(cy)), False) >= 0
                     else:
                         cx, cy = cog_pixel_from_table(st)
                         inside = False
-                    cv2.circle(out, (cx, cy), 3, (0, 255, 0) if inside else (0, 0, 255), -1)
+                    draw_marker(
+                        out, (cx, cy), (0, 255, 0) if inside else (0, 0, 255), smap,
+                        base_size=7, base_thickness=2, marker_type=cv2.MARKER_CROSS
+                    )
 
             draw_state(out, start, (0, 200, 0), 2, smap, show_details=False)
             draw_state(out, goal, (255, 0, 0), 2, smap, show_details=False)
-            cv2.circle(out, goal_px, 5, (255, 0, 0), -1)
+            draw_marker(out, goal_px, (255, 0, 0), smap, base_size=8, base_thickness=2, marker_type=cv2.MARKER_TILTED_CROSS)
 
-            t1 = time.perf_counter()
-            elapsed = t1 - t0
-
+            elapsed = time.perf_counter() - t0
             metrics = compute_run_metrics(
-                sol_points, sol_states, elapsed, it+1, n_propagations, n_invalid, len(nodes),
+                sol_points, sol_states, elapsed, iters, n_propagations, n_invalid, len(nodes),
                 ref_poly=ref_poly, seed=seed, success=True, timed_out=False
             )
-            return out, sol_points, nodes, it + 1, len(nodes), False, metrics
+            return out, sol_points, nodes, iters, len(nodes), False, metrics
 
     # sin solucion
     out = base_img.copy()
     draw_state(out, start, (0, 200, 0), 2, smap, show_details=False)
     draw_state(out, goal, (0, 0, 255), 2, smap, show_details=False)
     cv2.putText(out, "No se encontro la trayectoria", (10, smap.h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0, 0, 255), visual_thickness(smap, 2), cv2.LINE_AA)
     t1 = time.perf_counter()
     elapsed = t1 - t0
     metrics = compute_run_metrics(
-        None, None, elapsed, MAX_ITERS, n_propagations, n_invalid, len(nodes),
+        None, None, elapsed, iters, n_propagations, n_invalid, len(nodes),
         ref_poly=ref_poly, seed=seed, success=False, timed_out=False
     )
-    return out, None, nodes, MAX_ITERS, len(nodes), False, metrics
+    return out, None, nodes, iters, len(nodes), False, metrics
 
 def accumulate_attempt_metrics(total_metrics, attempt_metrics):
     if total_metrics is None:
@@ -989,7 +1158,8 @@ def merge_successful_attempt_metrics(total_metrics, success_metrics):
     return merged
 
 def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
-                                       start_state: State, goal_state: State, run_idx: int, total_runs: int):
+                                       start_state: State, goal_state: State, run_idx: int, total_runs: int,
+                                       viewer: Viewer = None):
     timeout_retries = 0
     attempt_idx = 0
     cumulative_metrics = None
@@ -1012,9 +1182,9 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
 
         base = walls_rgb.copy()
         for i in range(1, len(astar_path)):
-            cv2.line(base, astar_path[i-1], astar_path[i], (0,100,255), 1)
+            cv2.line(base, astar_path[i-1], astar_path[i], (0,100,255), visual_thickness(smap, 1))
         for wp in waypoints:
-            cv2.circle(base, (int(wp.x), int(wp.y)), 2, (0,100,255), -1)
+            draw_marker(base, (int(wp.x), int(wp.y)), (0,100,255), smap, base_size=6, base_thickness=1, marker_type=cv2.MARKER_DIAMOND)
 
         seed = RNG_SEED_BASE + run_idx * 100000 + attempt_idx * 997
         plan_img, sol_points, nodes, iters, node_count, timed_out, attempt_metrics = plan_rrt_star(
@@ -1022,7 +1192,8 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
             waypoints=waypoints,
             corridor_poly=[(wp.x, wp.y) for wp in waypoints],
             ref_poly=astar_path,
-            seed=seed
+            seed=seed,
+            viewer=viewer
         )
         cumulative_metrics = accumulate_attempt_metrics(cumulative_metrics, attempt_metrics)
         last_result = (plan_img, sol_points, nodes, iters, node_count)
@@ -1052,7 +1223,7 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
         }
 
 def run_repeated_experiments(smap: SewerMap, walls_rgb, picker,
-                             start_state: State, goal_state: State, repetitions):
+                             start_state: State, goal_state: State, repetitions, viewer: Viewer = None):
     all_metrics = []
     best_result = None
     best_length_m = float('inf')
@@ -1060,7 +1231,7 @@ def run_repeated_experiments(smap: SewerMap, walls_rgb, picker,
 
     for run_idx in range(repetitions):
         plan_img, sol_points, nodes, iters, node_count, run_info = run_single_simulation_with_retries(
-            smap, walls_rgb, picker, start_state, goal_state, run_idx, repetitions
+            smap, walls_rgb, picker, start_state, goal_state, run_idx, repetitions, viewer=viewer
         )
 
         if run_info["type"] in ("astar_fail", "waypoint_fail"):
@@ -1083,14 +1254,14 @@ def main():
     smap = SewerMap(resolve_map_path(MAP_PATH))
     walls_rgb = smap.draw_overlay()
 
-    picker = Picker(smap)
-    cv2.namedWindow("RRT* kinodinamico", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("RRT* kinodinamico", picker.mouse)
+    viewer = Viewer(smap)
+    picker = Picker(smap, viewer=viewer)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, viewer.display_w, viewer.display_h)
+    cv2.setMouseCallback(WINDOW_NAME, picker.mouse)
 
     show_instructions = True
     base = walls_rgb.copy()
-    if show_instructions:
-        draw_instructions(base)
     cur_img = base.copy()
     solution_img = None
 
@@ -1098,13 +1269,13 @@ def main():
         cur_img = base.copy()
 
         if picker.start_pos is not None:
-            cv2.circle(cur_img, picker.start_pos, 4, (0,255,0), -1)
+            draw_marker(cur_img, picker.start_pos, (0,255,0), smap, base_size=8, base_thickness=2, marker_type=cv2.MARKER_CROSS)
             if picker.start_th is not None:
                 s = State(picker.start_pos[0], picker.start_pos[1], picker.start_th, ROBOT_W0)
                 draw_state(cur_img, s, (0,255,0), 2, smap, show_details=True)
 
         if picker.goal_pos is not None:
-            cv2.circle(cur_img, picker.goal_pos, 4, (255,0,0), -1)
+            draw_marker(cur_img, picker.goal_pos, (255,0,0), smap, base_size=8, base_thickness=2, marker_type=cv2.MARKER_TILTED_CROSS)
             if picker.goal_th is not None:
                 g = State(picker.goal_pos[0], picker.goal_pos[1], picker.goal_th, ROBOT_W0)
                 draw_state(cur_img, g, (255,0,0), 2, smap, show_details=True)
@@ -1112,27 +1283,53 @@ def main():
         if solution_img is not None:
             cv2.addWeighted(solution_img, 0.7, cur_img, 0.3, 0, cur_img)
 
-        if show_instructions:
-            draw_instructions(cur_img)
-        cv2.imshow("RRT* kinodinamico", cur_img)
+        extra_lines = instruction_lines() if show_instructions else None
+        viewer.show(cur_img, extra_lines=extra_lines)
         k = cv2.waitKey(20) & 0xFF
 
         if k in (27, ord('q')):
             break
 
+        if k in (ord('+'), ord('=')):
+            viewer.zoom_in()
+            continue
+
+        if k in (ord('-'), ord('_')):
+            viewer.zoom_out()
+            continue
+
+        if k == ord('f'):
+            viewer.reset()
+            continue
+
+        if k == ord('w'):
+            viewer.pan(0, -1)
+            continue
+
+        if k == ord('s'):
+            viewer.pan(0, 1)
+            continue
+
+        if k == ord('a'):
+            viewer.pan(-1, 0)
+            continue
+
+        if k == ord('d'):
+            viewer.pan(1, 0)
+            continue
+
         if k == ord('r'):
             picker.reset(); solution_img = None
+            viewer.reset()
             show_instructions = True
             base = walls_rgb.copy()
-            if show_instructions:
-                draw_instructions(base)
 
         if k == 32:  # SPACE
             if not picker.have_start() or not picker.have_goal():
                 base2 = base.copy()
                 cv2.putText(base2, "Selecciona START y GOAL (pos+orient)", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", base2)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,0,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(base2)
                 cv2.waitKey(900)
                 continue
 
@@ -1143,28 +1340,28 @@ def main():
                 tmp = base.copy()
                 draw_state(tmp, start_state, (0,255,255), 2, smap, show_details=True)
                 cv2.putText(tmp, "Start no valido", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", tmp); cv2.waitKey(900)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,255,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(tmp); cv2.waitKey(900)
                 continue
 
             if not valid_configuration(smap, goal_state):
                 tmp = base.copy()
                 draw_state(tmp, goal_state, (0,255,255), 2, smap, show_details=True)
                 cv2.putText(tmp, "Goal no valido", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", tmp); cv2.waitKey(900)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,255,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(tmp); cv2.waitKey(900)
                 continue
             show_instructions = False
             base = walls_rgb.copy()
             best_result, all_metrics = run_repeated_experiments(
-                smap, walls_rgb, picker, start_state, goal_state, max(1, REP_SIM)
+                smap, walls_rgb, picker, start_state, goal_state, max(1, REP_SIM), viewer=viewer
             )
 
             if best_result is None:
                 out = base.copy()
                 cv2.putText(out, "No se pudo iniciar el experimento", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", out)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,0,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(out)
                 continue
 
             plan_img, sol_points, nodes, iters, node_count, run_info = best_result
@@ -1173,15 +1370,15 @@ def main():
             if run_info["type"] == "astar_fail":
                 tmp = base.copy()
                 cv2.putText(tmp, run_info["message"], (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", tmp); cv2.waitKey(900)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,0,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(tmp); cv2.waitKey(900)
                 continue
 
             if run_info["type"] == "waypoint_fail":
                 tmp = base.copy()
                 cv2.putText(tmp, run_info["message"], (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-                cv2.imshow("RRT* kinodinamico", tmp); cv2.waitKey(900)
+                            cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (0,0,255), visual_thickness(smap, 2), cv2.LINE_AA)
+                viewer.show(tmp); cv2.waitKey(900)
                 continue
 
             n_success = sum(1 for m in all_metrics if m["success"])
@@ -1196,8 +1393,8 @@ def main():
                 )
 
             out = (plan_img if plan_img is not None else base).copy()
-            cv2.putText(out, msg, (10, smap.h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-            cv2.imshow("RRT* kinodinamico", out)
+            cv2.putText(out, msg, (10, smap.h-20), cv2.FONT_HERSHEY_SIMPLEX, visual_font_scale(smap, 0.8, min_scale=0.4), (255,255,255), visual_thickness(smap, 2), cv2.LINE_AA)
+            viewer.show(out)
 
     cv2.destroyAllWindows()
 
