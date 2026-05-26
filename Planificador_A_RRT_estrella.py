@@ -113,7 +113,6 @@ REP_SIM = 10              # numero de simulaciones validas a ejecutar
 DRAW_EVERY = 100             # refresco de dibujo del arbol
 N_FRAMES = 6                 # fotogramas de la solucion a dibujar
 N_WAYPOINTS = 10              # waypoints generados desde A*
-WINDOW_NAME = ABLATION_NAME
 VIEW_MAX_W = 1600
 VIEW_MAX_H = 900
 VIEW_ZOOM_STEP = 1.25
