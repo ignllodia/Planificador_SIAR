@@ -1,7 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
+
 """
-RRT* kinodinámico guiado por A* para SIAR.
-Basado en rrt_kinodinamico_guiado_astar.py pero con rewiring (RRT*):
+Planificador híbrido A* + RRT* kinodinámico para el robot SIAR.
+
+El sistema combina una referencia global obtenida mediante A*, una expansión
+local kinodinámica basada en RRT y una fase posterior de refinamiento mediante
+rewiring. Cada configuración generada se valida considerando colisiones,
+posición de las ruedas, contacto con el terreno y estabilidad estática.
 """
 
 import cv2
@@ -15,7 +20,7 @@ import time
 from pathlib import Path
 
 # --------------------- Mapa ---------------------
-MAP_PATH = "Pb4.png"          # ruta del mapa en escala de grises
+MAP_PATH = "Pb4_ampliado.png"          # ruta del mapa en escala de grises
 
 def resolve_map_path(map_path):
     p = Path(map_path)
@@ -56,7 +61,7 @@ ROBOT_W_MAX = 0.85            # ancho maximo permitido (m)
 ROBOT_W0    = 0.70            # ancho inicial (m)
 
 # --------------------- Escala ---------------------
-PIXELS_PER_M = 65           # pixeles por metro
+PIXELS_PER_M = 75           # pixeles por metro
 def m2px(m): return int(round(m * PIXELS_PER_M))
 def px2m(px): return float(px) / PIXELS_PER_M
 
@@ -73,10 +78,22 @@ def calcular_largo(w_m): return -0.675*w_m + 1.3175
 WS = [row[1] for row in TABLA_CONFIGURACIONES]
 def config_from_w(w): return min(TABLA_CONFIGURACIONES, key=lambda r: abs(r[1]-w))
 
+# --------------------- Variante de ablacion ---------------------
+PLANNER_NAME = "Planificador híbrido A* + RRT* kinodinámico"
+WINDOW_NAME = PLANNER_NAME
+USE_GEOMETRIC_PLANNER = False
+USE_REWIRING = False
+USE_POST_SOLUTION_RRT_STAR = True
+USE_ASTAR_GUIDANCE = True
+USE_SWITCHABLE_CONTROL_SETS = False
+USE_TIMEOUT_RESTARTS = False
+METRIC_NA = "-"
+GEOMETRIC_STEP_M = 0.35
+    
 # --------------------- Planificador ---------------------
 MAX_ITERS = 50000             # iteraciones maximas
 TREE_TIMEOUT = 60.0           # segundos antes de reiniciar el arbol si no hay solucion
-POST_SOLUTION_IMPROVEMENT_TIME = 20  # segundos extra de refinamiento tras la primera solucion
+POST_SOLUTION_IMPROVEMENT_TIME = 10 # segundos extra de refinamiento tras la primera solucion
 GOAL_SAMPLING_RATE = 0.1     # prob. de muestrear el goal
 DT = 0.05                     # paso de integracion (s)
 TPROP = 0.5                   # horizonte de propagacion (s)
@@ -90,13 +107,13 @@ TAU_H = 0.6                   # constante de tiempo del filtro de ancho
 K_SUBSET    = 64              # vecinos muestreados en nearest aproximado
 EXACT_EVERY = 20              # frecuencia de nearest exacto
 RNG_SEED_BASE = 12345         # semilla base; se deriva por corrida e intento
-REP_SIM = 1               # numero de simulaciones validas a ejecutar
+REP_SIM = 10              # numero de simulaciones validas a ejecutar
 
 # Dibujo
 DRAW_EVERY = 100             # refresco de dibujo del arbol
 N_FRAMES = 6                 # fotogramas de la solucion a dibujar
 N_WAYPOINTS = 10              # waypoints generados desde A*
-WINDOW_NAME = "RRT* kinodinamico"
+WINDOW_NAME = ABLATION_NAME
 VIEW_MAX_W = 1600
 VIEW_MAX_H = 900
 VIEW_ZOOM_STEP = 1.25
@@ -106,7 +123,7 @@ VISUAL_REF_MAX_DIM = 1400
 SHOW_STATE_LABELS = True
 
 # Sesgo a waypoints y corredor
-WAYPOINT_BIAS = 0.5           # prob. de muestrear waypoint activo
+WAYPOINT_BIAS = 0.2           # prob. de muestrear waypoint activo
 CORRIDOR_WIDTH_M = 0.6        # ancho de banda para muestreo libre (m)
 CENTER_BIAS_WEIGHT = 0.05     # penaliza pegarse a pared en A*
 
@@ -115,7 +132,7 @@ DEBUG = True                  # habilita logs debug
 DEBUG_EVERY = 200             # frecuencia de logs debug
 
 # RRT*
-NEIGHBOR_RADIUS_M = 0.3       # radio de vecinos para rewiring (m)
+NEIGHBOR_RADIUS_M = 0.1       # radio de vecinos para rewiring (m)
 HEADING_COST_WEIGHT = m2px(0.3)  # penalizacion por cambio de heading en coste
 REWIRE_POS_TOL = m2px(0.20)   # tolerancia posicion para rewire (px)
 REWIRE_TH_TOL = math.radians(20.0)  # tolerancia heading para rewire
@@ -138,6 +155,75 @@ CONTROL_SET_ALL = [
     (0.12,  0.8,   0),
     (0.12, -0.8,   0),
 ]
+
+CONTROL_SET_BASIC = [
+    (0.25,  0.0,   0),
+    (0.25,  0.2,   0),
+    (0.25, -0.2,   0),
+    (0.00,  0.0,  -1),
+    (0.00,  0.0,  +1),
+]
+
+CONTROL_SET_STRAIGHT = [
+    (0.35,  0.0,   0),
+    (0.25,  0.0,   0),
+    (0.25,  0.2,   0),
+    (0.25, -0.2,   0),
+    (0.10,  0.3,   0),
+    (0.10, -0.3,   0),
+    (0.00,  0.0,  -1),
+    (0.00,  0.0,  +1),
+]
+
+CONTROL_SET_CURVE = [
+    (0.10,  0.6,   0),
+    (0.10, -0.6,   0),
+    (0.12,  0.8,   0),
+    (0.12, -0.8,   0),
+    (0.10,  0.3,   0),
+    (0.10, -0.3,   0),
+    (0.00,  0.2,   0),
+    (0.00, -0.2,   0),
+    (0.00,  0.0,  -1),
+    (0.00,  0.0,  +1),
+]
+
+CONTROL_SET_NOMINAL = CONTROL_SET_STRAIGHT
+CONTROL_SET_RECOVERY = CONTROL_SET_CURVE
+CONTROL_SET_ENTER_CURVE_DTH = math.radians(25.0)
+CONTROL_SET_EXIT_CURVE_DTH = math.radians(12.0)
+
+
+def local_clearance_m(smap: "SewerMap", state: "State"):
+    x, y = int(round(state.x)), int(round(state.y))
+    if not smap.inside_bounds(x, y):
+        return 0.0
+    return px2m(float(smap.wall_dist_px[y, x]))
+
+
+def target_turn_error(state: "State", target_state: "State"):
+    dx, dy = target_state.x - state.x, target_state.y - state.y
+    if math.hypot(dx, dy) > 1e-6:
+        desired_th = math.atan2(dy, dx)
+    else:
+        desired_th = target_state.th
+    return abs(ang_dist(state.th, desired_th))
+
+
+def select_control_set(smap: "SewerMap", state: "State", current_mode, target_state: "State" = None):
+    if not USE_SWITCHABLE_CONTROL_SETS:
+        return CONTROL_SET_ALL, current_mode
+
+    if target_state is None:
+        return CONTROL_SET_STRAIGHT, "straight"
+
+    turn_error = target_turn_error(state, target_state)
+    if current_mode == "curve":
+        next_mode = "straight" if turn_error < CONTROL_SET_EXIT_CURVE_DTH else "curve"
+    else:
+        next_mode = "curve" if turn_error > CONTROL_SET_ENTER_CURVE_DTH else "straight"
+    controls = CONTROL_SET_CURVE if next_mode == "curve" else CONTROL_SET_STRAIGHT
+    return controls, next_mode
 
 
 # --------------------- Utilidades ---------------------
@@ -386,6 +472,17 @@ def valid_configuration(smap: "SewerMap", state: State):
     if cv2.pointPolygonTest(hull.astype(np.float32), (float(cx), float(cy)), False) < 0: return False
     return True
 
+
+def valid_geometric_configuration(smap: "SewerMap", state: State):
+    x, y = int(round(state.x)), int(round(state.y))
+    return smap.inside_bounds(x, y) and smap.traversable_mask[y, x] != 0
+
+
+def valid_planner_configuration(smap: "SewerMap", state: State):
+    if USE_GEOMETRIC_PLANNER:
+        return valid_geometric_configuration(smap, state)
+    return valid_configuration(smap, state)
+
 # --------------------- Dinámica ---------------------
 def propagate(state: State, control, smap: SewerMap):
     v, w_z, step_ref = control
@@ -423,10 +520,37 @@ def propagate(state: State, control, smap: SewerMap):
     if not valid_configuration(smap, new_state): return None, None, None
     return new_state, path_pts, traj_states
 
+# --------------------- Geometrico simple ---------------------
+def geometric_extend(state: State, target: State, smap: SewerMap):
+    dx, dy = target.x - state.x, target.y - state.y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-9:
+        return None, None, None
+
+    step_px = min(m2px(GEOMETRIC_STEP_M), dist)
+    ux, uy = dx / dist, dy / dist
+    n_steps = max(2, int(math.ceil(step_px / max(1, m2px(0.03)))))
+    path_pts, traj_states = [], []
+    th = math.atan2(uy, ux)
+
+    for i in range(1, n_steps + 1):
+        alpha = i / n_steps
+        x = state.x + ux * step_px * alpha
+        y = state.y + uy * step_px * alpha
+        st = State(x, y, th, ROBOT_W0)
+        if not valid_geometric_configuration(smap, st):
+            return None, None, None
+        path_pts.append((int(round(x)), int(round(y))))
+        traj_states.append(st)
+
+    return traj_states[-1], path_pts, traj_states
+
 # --------------------- Métrica ---------------------
 def state_distance(a: State, b: State):
     dx, dy = a.x - b.x, a.y - b.y
     dpos = math.hypot(dx, dy)
+    if USE_GEOMETRIC_PLANNER:
+        return dpos
     dth  = ang_dist(a.th, b.th)
     dw   = abs(a.w - b.w)
     return dpos + m2px(0.5)*dth + m2px(0.2)*dw
@@ -568,8 +692,8 @@ def compute_run_metrics(sol_points, sol_states, elapsed, iterations,
         "_invalid_total": n_invalid,
         "invalid_pct": fail_pct,
         "node_count": node_count,
-        "timeout_retries": timeout_retries,
-        "attempts": attempts,
+        "timeout_retries": timeout_retries if USE_TIMEOUT_RESTARTS else None,
+        "attempts": attempts if USE_TIMEOUT_RESTARTS else None,
         "path_length_m": None,
         "width_change_count": None,
         "mean_ref_dev_m": None,
@@ -578,8 +702,8 @@ def compute_run_metrics(sol_points, sol_states, elapsed, iterations,
         return metrics
 
     length_m = px2m(path_cost(sol_points))
-    width_changes = width_change_stats(sol_states)
-    mean_ref_dev_m = reference_deviation_mean_m(sol_points, ref_poly)
+    width_changes = None if USE_GEOMETRIC_PLANNER else width_change_stats(sol_states)
+    mean_ref_dev_m = reference_deviation_mean_m(sol_points, ref_poly) if USE_ASTAR_GUIDANCE else None
 
     metrics.update({
         "path_length_m": length_m,
@@ -597,8 +721,11 @@ def mean_std(values):
 
 def fmt_metric(value, fmt_spec):
     if value is None:
-        return "NA"
+        return METRIC_NA
     return format(value, fmt_spec)
+
+def fmt_plain(value):
+    return METRIC_NA if value is None else str(value)
 
 def print_timeout_retry(run_idx, total_runs, attempt_idx, max_restarts=None):
     msg = f"[TIMEOUT run={run_idx+1}/{total_runs}] intento={attempt_idx}"
@@ -616,16 +743,16 @@ def print_run_metrics(metrics, run_idx=None, total_runs=None):
         print(f"{prefix} seed={metrics['seed']} | elapsed={metrics['elapsed_s']:.3f}s | "
               f"iters={metrics['iters']} | {status} | prop={metrics['propagations']} | "
               f"invalid_pct={metrics['invalid_pct']:.1f}% | "
-              f"nodes={metrics['node_count']} | attempts={metrics['attempts']} | "
-              f"timeout_retries={metrics['timeout_retries']}")
+              f"nodes={metrics['node_count']} | attempts={fmt_plain(metrics['attempts'])} | "
+              f"timeout_retries={fmt_plain(metrics['timeout_retries'])}")
         return
 
     print(
         f"{prefix} seed={metrics['seed']} | elapsed={metrics['elapsed_s']:.3f}s | "
         f"iters={metrics['iters']} | length={fmt_metric(metrics['path_length_m'], '.2f')}m | "
         f"prop={metrics['propagations']} | invalid_pct={metrics['invalid_pct']:.1f}% | "
-        f"nodes={metrics['node_count']} | attempts={metrics['attempts']} | "
-        f"timeout_retries={metrics['timeout_retries']} | "
+        f"nodes={metrics['node_count']} | attempts={fmt_plain(metrics['attempts'])} | "
+        f"timeout_retries={fmt_plain(metrics['timeout_retries'])} | "
         f"dref_mean={fmt_metric(metrics['mean_ref_dev_m'], '.3f')}m | "
         f"w_changes={fmt_metric(metrics['width_change_count'], '.0f')}"
     )
@@ -635,7 +762,8 @@ def print_experiment_summary(all_metrics):
     successes = [m for m in all_metrics if m["success"]]
     n_success = len(successes)
     success_rate = 100.0 * n_success / max(1, total)
-    total_timeout_retries = sum(m["timeout_retries"] for m in all_metrics)
+    timeout_values = [m["timeout_retries"] for m in all_metrics if m["timeout_retries"] is not None]
+    total_timeout_retries = sum(timeout_values) if timeout_values else METRIC_NA
     print(f"[SUMMARY] runs={total} | success={n_success}/{total} ({success_rate:.1f}%) | "
           f"timeout_retries={total_timeout_retries}")
 
@@ -761,6 +889,8 @@ def path_cost(path_pts):
 
 def edge_cost(parent_state: State, child_state: State, path_pts):
     base = path_cost(path_pts)
+    if USE_GEOMETRIC_PLANNER:
+        return base
     dheading = ang_dist(parent_state.th, child_state.th)
     return base + HEADING_COST_WEIGHT * dheading
 
@@ -779,6 +909,8 @@ def can_connect_states(a: State, b: State):
     )
 
 def goal_reached(state: State, goal: State):
+    if USE_GEOMETRIC_PLANNER:
+        return math.hypot(state.x - goal.x, state.y - goal.y) < NEAR_GOAL_DIST
     return (
         math.hypot(state.x - goal.x, state.y - goal.y) < NEAR_GOAL_DIST and
         ang_dist(state.th, goal.th) < NEAR_GOAL_DTH and
@@ -798,7 +930,8 @@ def extract_solution(nodes, goal_idx, smap: "SewerMap"):
         idx = n.parent
     sol_points = sol_points[::-1]
     sol_states = sol_states[::-1]
-    sol_states = minimize_width_changes(sol_states, smap)
+    if not USE_GEOMETRIC_PLANNER:
+        sol_states = minimize_width_changes(sol_states, smap)
     return sol_points, sol_states
 
 def best_goal_node_index(nodes, goal: State):
@@ -838,7 +971,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
     first_solution_t = None
     n_propagations = 0
     n_invalid = 0
-    controls = CONTROL_SET_ALL
+    control_mode = "straight"
 
     def best_control_towards(parent_state: State, target_state: State):
         nonlocal n_propagations, n_invalid
@@ -848,6 +981,16 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         best_score = float('inf')
         valid_count = 0
 
+        if USE_GEOMETRIC_PLANNER:
+            n_propagations += 1
+            ns, path_pts, traj_states = geometric_extend(parent_state, target_state, smap)
+            if ns is None:
+                n_invalid += 1
+                return None, None, None, float('inf'), 0
+            return ns, path_pts, traj_states, state_distance(ns, target_state), 1
+
+        nonlocal control_mode
+        controls, control_mode = select_control_set(smap, parent_state, control_mode, target_state)
         for u in controls:
             n_propagations += 1
             ns, path_pts, traj_states = propagate(parent_state, u, smap)
@@ -868,7 +1011,7 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         now = time.perf_counter()
         # timeout y max iters solo aplican antes de la primera solucion
         if first_solution_t is None:
-            if (now - t0) > TREE_TIMEOUT:
+            if USE_TIMEOUT_RESTARTS and (now - t0) > TREE_TIMEOUT:
                 elapsed = now - t0
                 metrics = compute_run_metrics(
                     None, None, elapsed, iters, n_propagations, n_invalid, len(nodes),
@@ -928,8 +1071,9 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
                 print(f"[DBG it={it}] nodo nearest sin estado idx={idx_near}, se salta iter")
             continue
 
-        # primer intento desde nearest para centrar vecindario
-        seed_state, _, _, seed_score, valid_controls = best_control_towards(near, target)
+        # primer intento desde nearest. Antes de la primera solucion se usa RRT puro;
+        # despues se activa RRT* para refinar sin penalizar la busqueda inicial.
+        seed_state, seed_path, seed_traj, seed_score, valid_controls = best_control_towards(near, target)
 
         if DEBUG and (it % DEBUG_EVERY) == 0:
             wp_str = f"wp={wp_idx}/{len(waypoints)}" if cur_wp is not None else "wp=None"
@@ -941,34 +1085,43 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         if seed_state is None:
             continue
 
-        # elegir padre usando conexion dinamica recalculada para cada candidato
-        parent_candidates = set(neighborhood(nodes, seed_state, neighbor_radius_px))
-        parent_candidates.add(idx_near)
+        rrt_star_active = USE_REWIRING or (USE_POST_SOLUTION_RRT_STAR and first_solution_t is not None)
 
-        best_parent = None
-        best_state = None
-        best_path = None
-        best_traj = None
-        best_target_dist = float('inf')
-        best_total_cost = float('inf')
+        if rrt_star_active:
+            # elegir padre usando conexion dinamica recalculada para cada candidato
+            parent_candidates = set(neighborhood(nodes, seed_state, neighbor_radius_px))
+            parent_candidates.add(idx_near)
 
-        for pidx in parent_candidates:
-            cand_state, cand_path, cand_traj, cand_dist, _ = best_control_towards(nodes[pidx].state, target)
-            if cand_state is None:
-                continue
+            best_parent = None
+            best_state = None
+            best_path = None
+            best_traj = None
+            best_target_dist = float('inf')
+            best_total_cost = float('inf')
 
-            cand_edge = edge_cost(nodes[pidx].state, cand_state, cand_path)
-            cand_total = nodes[pidx].cost + cand_edge
+            for pidx in parent_candidates:
+                cand_state, cand_path, cand_traj, cand_dist, _ = best_control_towards(nodes[pidx].state, target)
+                if cand_state is None:
+                    continue
 
-            better_target = cand_dist + 1e-9 < best_target_dist
-            same_target_better_cost = abs(cand_dist - best_target_dist) <= 1e-9 and cand_total < best_total_cost
-            if better_target or same_target_better_cost:
-                best_parent = pidx
-                best_state = cand_state
-                best_path = cand_path
-                best_traj = cand_traj
-                best_target_dist = cand_dist
-                best_total_cost = cand_total
+                cand_edge = edge_cost(nodes[pidx].state, cand_state, cand_path)
+                cand_total = nodes[pidx].cost + cand_edge
+
+                better_target = cand_dist + 1e-9 < best_target_dist
+                same_target_better_cost = abs(cand_dist - best_target_dist) <= 1e-9 and cand_total < best_total_cost
+                if better_target or same_target_better_cost:
+                    best_parent = pidx
+                    best_state = cand_state
+                    best_path = cand_path
+                    best_traj = cand_traj
+                    best_target_dist = cand_dist
+                    best_total_cost = cand_total
+        else:
+            best_parent = idx_near
+            best_state = seed_state
+            best_path = seed_path
+            best_traj = seed_traj
+            best_total_cost = nodes[idx_near].cost + edge_cost(nodes[idx_near].state, seed_state, seed_path)
 
         if best_parent is None or best_state is None:
             continue
@@ -979,55 +1132,56 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
         children.append([])
         children[best_parent].append(new_idx)
 
-        # evitar ciclos: no rewire de ancestros del nuevo nodo
-        ancestors_of_new = set()
-        cur = best_parent
-        while cur != -1:
-            ancestors_of_new.add(cur)
-            cur = nodes[cur].parent
+        if rrt_star_active:
+            # evitar ciclos: no rewire de ancestros del nuevo nodo
+            ancestors_of_new = set()
+            cur = best_parent
+            while cur != -1:
+                ancestors_of_new.add(cur)
+                cur = nodes[cur].parent
 
-        # rewire con conexion dinamica valida
-        neighbors = neighborhood(nodes, best_state, neighbor_radius_px)
-        for nidx in neighbors:
-            if nidx in (best_parent, new_idx):
-                continue
-            if nidx in ancestors_of_new:
-                continue
+            # rewire con conexion dinamica valida
+            neighbors = neighborhood(nodes, best_state, neighbor_radius_px)
+            for nidx in neighbors:
+                if nidx in (best_parent, new_idx):
+                    continue
+                if nidx in ancestors_of_new:
+                    continue
 
-            neighbor_state = nodes[nidx].state
-            conn_state, conn_path, conn_traj, _, _ = best_control_towards(node_new.state, neighbor_state)
-            if conn_state is None or not can_connect_states(conn_state, neighbor_state):
-                continue
+                neighbor_state = nodes[nidx].state
+                conn_state, conn_path, conn_traj, _, _ = best_control_towards(node_new.state, neighbor_state)
+                if conn_state is None or not can_connect_states(conn_state, neighbor_state):
+                    continue
 
-            rewire_path = list(conn_path) if conn_path is not None else []
-            target_pt = (int(round(neighbor_state.x)), int(round(neighbor_state.y)))
-            if not rewire_path:
-                rewire_path = [target_pt]
-            elif math.hypot(rewire_path[-1][0] - target_pt[0], rewire_path[-1][1] - target_pt[1]) > 0.5:
-                rewire_path.append(target_pt)
+                rewire_path = list(conn_path) if conn_path is not None else []
+                target_pt = (int(round(neighbor_state.x)), int(round(neighbor_state.y)))
+                if not rewire_path:
+                    rewire_path = [target_pt]
+                elif math.hypot(rewire_path[-1][0] - target_pt[0], rewire_path[-1][1] - target_pt[1]) > 0.5:
+                    rewire_path.append(target_pt)
 
-            rewire_traj = list(conn_traj) if conn_traj is not None else []
-            rewire_traj.append(neighbor_state)
+                rewire_traj = list(conn_traj) if conn_traj is not None else []
+                rewire_traj.append(neighbor_state)
 
-            alt_cost = node_new.cost + edge_cost(node_new.state, neighbor_state, rewire_path)
-            if alt_cost + 1e-6 < nodes[nidx].cost:
-                old_parent = nodes[nidx].parent
-                old_cost = nodes[nidx].cost
+                alt_cost = node_new.cost + edge_cost(node_new.state, neighbor_state, rewire_path)
+                if alt_cost + 1e-6 < nodes[nidx].cost:
+                    old_parent = nodes[nidx].parent
+                    old_cost = nodes[nidx].cost
 
-                nodes[nidx].parent = new_idx
-                nodes[nidx].path = rewire_path
-                nodes[nidx].traj_states = rewire_traj
-                nodes[nidx].cost = alt_cost
+                    nodes[nidx].parent = new_idx
+                    nodes[nidx].path = rewire_path
+                    nodes[nidx].traj_states = rewire_traj
+                    nodes[nidx].cost = alt_cost
 
-                if old_parent != -1:
-                    try:
-                        children[old_parent].remove(nidx)
-                    except ValueError:
-                        pass
-                if nidx not in children[new_idx]:
-                    children[new_idx].append(nidx)
+                    if old_parent != -1:
+                        try:
+                            children[old_parent].remove(nidx)
+                        except ValueError:
+                            pass
+                    if nidx not in children[new_idx]:
+                        children[new_idx].append(nidx)
 
-                propagate_subtree_cost_delta(nodes, children, nidx, alt_cost - old_cost)
+                    propagate_subtree_cost_delta(nodes, children, nidx, alt_cost - old_cost)
 
         # avance de waypoint
         if use_wp and wp_idx < len(waypoints):
@@ -1123,8 +1277,12 @@ def plan_rrt_star(smap: SewerMap, start: State, goal: State, vis_img, waypoints=
 def accumulate_attempt_metrics(total_metrics, attempt_metrics):
     if total_metrics is None:
         total_metrics = attempt_metrics.copy()
-        total_metrics["attempts"] = 1
-        total_metrics["timeout_retries"] = 1 if attempt_metrics["timed_out"] else 0
+        if USE_TIMEOUT_RESTARTS:
+            total_metrics["attempts"] = 1
+            total_metrics["timeout_retries"] = 1 if attempt_metrics["timed_out"] else 0
+        else:
+            total_metrics["attempts"] = None
+            total_metrics["timeout_retries"] = None
         return total_metrics
 
     total_metrics["elapsed_s"] += attempt_metrics["elapsed_s"]
@@ -1137,9 +1295,10 @@ def accumulate_attempt_metrics(total_metrics, attempt_metrics):
     total_metrics["node_count"] = attempt_metrics["node_count"]
     total_metrics["seed"] = attempt_metrics["seed"]
     total_metrics["timed_out"] = attempt_metrics["timed_out"]
-    total_metrics["attempts"] += 1
-    if attempt_metrics["timed_out"]:
-        total_metrics["timeout_retries"] += 1
+    if USE_TIMEOUT_RESTARTS:
+        total_metrics["attempts"] += 1
+        if attempt_metrics["timed_out"]:
+            total_metrics["timeout_retries"] += 1
     return total_metrics
 
 def merge_successful_attempt_metrics(total_metrics, success_metrics):
@@ -1166,32 +1325,38 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
     last_result = None
 
     while True:
-        astar_path, _ = astar_path_guided(smap, picker.start_pos, picker.goal_pos)
-        if astar_path is None or len(astar_path) < 2:
-            return None, None, None, None, None, {
-                "type": "astar_fail",
-                "message": "A* no encontro camino transitable",
-            }
-
-        waypoints = build_waypoint_states(smap, astar_path, w_default=ROBOT_W0)
-        if len(waypoints) < 2:
-            return None, None, None, None, None, {
-                "type": "waypoint_fail",
-                "message": "Waypoints insuficientes",
-            }
-
+        astar_path = None
+        waypoints = None
+        corridor_poly = None
         base = walls_rgb.copy()
-        for i in range(1, len(astar_path)):
-            cv2.line(base, astar_path[i-1], astar_path[i], (0,100,255), visual_thickness(smap, 1))
-        for wp in waypoints:
-            draw_marker(base, (int(wp.x), int(wp.y)), (0,100,255), smap, base_size=6, base_thickness=1, marker_type=cv2.MARKER_DIAMOND)
+
+        if USE_ASTAR_GUIDANCE:
+            astar_path, _ = astar_path_guided(smap, picker.start_pos, picker.goal_pos)
+            if astar_path is None or len(astar_path) < 2:
+                return None, None, None, None, None, {
+                    "type": "astar_fail",
+                    "message": "A* no encontro camino transitable",
+                }
+
+            waypoints = build_waypoint_states(smap, astar_path, w_default=ROBOT_W0)
+            if len(waypoints) < 2:
+                return None, None, None, None, None, {
+                    "type": "waypoint_fail",
+                    "message": "Waypoints insuficientes",
+                }
+
+            for i in range(1, len(astar_path)):
+                cv2.line(base, astar_path[i-1], astar_path[i], (0,100,255), visual_thickness(smap, 1))
+            for wp in waypoints:
+                draw_marker(base, (int(wp.x), int(wp.y)), (0,100,255), smap, base_size=6, base_thickness=1, marker_type=cv2.MARKER_DIAMOND)
+            corridor_poly = [(wp.x, wp.y) for wp in waypoints]
 
         seed = RNG_SEED_BASE + run_idx * 100000 + attempt_idx * 997
         plan_img, sol_points, nodes, iters, node_count, timed_out, attempt_metrics = plan_rrt_star(
             smap, start_state, goal_state, base,
             waypoints=waypoints,
-            corridor_poly=[(wp.x, wp.y) for wp in waypoints],
-            ref_poly=astar_path,
+            corridor_poly=corridor_poly,
+            ref_poly=astar_path if USE_ASTAR_GUIDANCE else None,
             seed=seed,
             viewer=viewer
         )
@@ -1206,7 +1371,7 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
                 "metrics": final_metrics,
             }
 
-        if timed_out:
+        if USE_TIMEOUT_RESTARTS and timed_out:
             timeout_retries += 1
             attempt_idx += 1
             cumulative_metrics["timeout_retries"] = timeout_retries
@@ -1214,7 +1379,8 @@ def run_single_simulation_with_retries(smap: SewerMap, walls_rgb, picker,
             continue
 
         final_metrics = cumulative_metrics.copy()
-        final_metrics["timeout_retries"] = timeout_retries
+        if USE_TIMEOUT_RESTARTS:
+            final_metrics["timeout_retries"] = timeout_retries
         print_run_metrics(final_metrics, run_idx=run_idx, total_runs=total_runs)
         plan_img, sol_points, nodes, iters, node_count = last_result
         return plan_img, sol_points, nodes, iters, node_count, {
@@ -1336,7 +1502,7 @@ def main():
             start_state = State(picker.start_pos[0], picker.start_pos[1], picker.start_th, ROBOT_W0)
             goal_state  = State(picker.goal_pos[0],  picker.goal_pos[1],  picker.goal_th,  ROBOT_W0)
 
-            if not valid_configuration(smap, start_state):
+            if not valid_planner_configuration(smap, start_state):
                 tmp = base.copy()
                 draw_state(tmp, start_state, (0,255,255), 2, smap, show_details=True)
                 cv2.putText(tmp, "Start no valido", (10, 50),
@@ -1344,7 +1510,7 @@ def main():
                 viewer.show(tmp); cv2.waitKey(900)
                 continue
 
-            if not valid_configuration(smap, goal_state):
+            if not valid_planner_configuration(smap, goal_state):
                 tmp = base.copy()
                 draw_state(tmp, goal_state, (0,255,255), 2, smap, show_details=True)
                 cv2.putText(tmp, "Goal no valido", (10, 50),
@@ -1389,7 +1555,7 @@ def main():
             else:
                 msg += (
                     f" | nodos: {node_count} | L={best_metrics['path_length_m']:.2f}m | "
-                    f"reint_timeout={best_metrics['timeout_retries']}"
+                    f"reint_timeout={fmt_plain(best_metrics['timeout_retries'])}"
                 )
 
             out = (plan_img if plan_img is not None else base).copy()
@@ -1401,3 +1567,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
