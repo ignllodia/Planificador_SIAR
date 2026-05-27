@@ -11,11 +11,9 @@ Planificador_SIAR/
 │
 ├── Planificador_A_RRT_estrella.py   # Código principal del planificador final
 ├── Pb4_ampliado.png                 # Mapa de alcantarillado utilizado
-├── requirements.txt                 # Dependencias del proyecto
+├── Pb4.png                          # Primer mapa de alcantarillado utilizado
 └── README.md                        # Descripción del repositorio
 ```
-
-El repositorio se centra únicamente en el resultado final del trabajo. Las versiones intermedias, pruebas de ablación y scripts antiguos no se incluyen como parte de la estructura principal, ya que su evolución queda reflejada en el historial de Git.
 
 ## Archivo principal
 
@@ -254,17 +252,3 @@ Tras seleccionar inicio y objetivo, el planificador muestra:
 
 La trayectoria final se obtiene considerando tanto la geometría del mapa como la estabilidad estática del robot.
 
-## Limitaciones
-
-La implementación actual trabaja sobre un mapa 2D segmentado. No incluye todavía integración completa en ROS/Gazebo ni validación sobre la plataforma física real. Además, la estabilidad considerada es estática, por lo que no se modelan de forma completa efectos dinámicos como aceleraciones, inercias, deslizamientos, pendientes o pérdidas de contacto durante el movimiento.
-
-## Trabajos futuros
-
-Algunas posibles líneas de mejora son:
-
-- integración del planificador en ROS/Gazebo,
-- validación sobre el robot SIAR real,
-- uso de mapas 3D o nubes de puntos,
-- incorporación de criterios de estabilidad dinámica,
-- optimización automática del conjunto de controles,
-- uso de aprendizaje por refuerzo para mejorar la selección de acciones.
